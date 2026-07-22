@@ -14,7 +14,15 @@ import job_intake_registry
 import job_intake_service
 import job_intake_page
 from job_intake_registry import STATUS_RPD_CREATED
-from job_intake_page import PART_MATERIAL_COL, PART_QTY_COL, PART_STRATEGY_COL, JobIntakePage
+from job_intake_page import (
+    PART_DXF_COL,
+    PART_MATERIAL_COL,
+    PART_QTY_COL,
+    PART_STRATEGY_COL,
+    PART_THICKNESS_COL,
+    PART_UNIT_COL,
+    JobIntakePage,
+)
 
 
 @pytest.fixture(scope="module")
@@ -102,6 +110,43 @@ def test_create_rpd_transitions_status_and_writes_file(qapp, isolated_roots) -> 
         assert rpd_path.exists()
         assert rpd_path.name == "W50123.rpd"
         assert "<JobName>W50123</JobName>" in rpd_path.read_text(encoding="utf-8")
+    finally:
+        page.deleteLater()
+
+
+def test_unit_and_strategy_are_hidden_but_still_feed_the_radan_import(qapp, isolated_roots) -> None:
+    """Neither is a decision the user makes - Unit is always "in" and Strategy
+    is derived from Material - so they're hidden from the grid. They must stay
+    in the model: the RADAN import CSV is a fixed 6-column format that includes
+    both, so dropping the columns would break build_import_csv_rows."""
+    page = _make_page(qapp)
+    try:
+        page._create_intake("M50777", "", [_dxf(isolated_roots, "Gusset.DXF")])
+        page.refresh()
+        page.queue_table.selectRow(0)
+
+        assert page.parts_table.isColumnHidden(PART_UNIT_COL)
+        assert page.parts_table.isColumnHidden(PART_STRATEGY_COL)
+        # The columns the user does act on stay visible.
+        for column in (PART_DXF_COL, PART_MATERIAL_COL, PART_THICKNESS_COL, PART_QTY_COL):
+            assert not page.parts_table.isColumnHidden(column)
+
+        page.parts_table.item(0, PART_MATERIAL_COL).setText("Stainless Steel")
+        page.parts_table.item(0, PART_THICKNESS_COL).setText("0.25")
+        page._save_details()
+
+        entry = job_intake_registry.get_entry("M50777")
+        assert entry is not None
+        part = entry["material_qty"][0]
+        # Still populated despite never being shown.
+        assert part["unit"] == "in"
+        assert part["strategy"] == "N2"
+
+        # And the import CSV still gets all six columns.
+        rows = job_intake_service.build_import_csv_rows(entry)
+        assert len(rows[0]) == 6
+        assert rows[0][4] == "in"
+        assert rows[0][5] == "N2"
     finally:
         page.deleteLater()
 

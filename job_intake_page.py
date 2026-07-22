@@ -64,6 +64,13 @@ PART_STRATEGY_COL = 5
 PART_PO_REF_COL = 6
 PART_COLUMNS = ("DXF", "Material", "Thickness", "Qty", "Unit", "Strategy", "PO Ref")
 
+# Kept in the model but hidden from the grid. Neither is a real decision the
+# user makes: Unit is always "in" here, and Strategy is derived from Material.
+# They stay as columns rather than being deleted because the RADAN import CSV
+# is a fixed 6-column format that includes both - build_import_csv_rows reads
+# these cells, so removing them would break the import.
+PART_HIDDEN_COLUMNS = (PART_UNIT_COL, PART_STRATEGY_COL)
+
 POLL_INTERVAL_MS = 4000
 
 
@@ -305,6 +312,8 @@ class JobIntakePage(QWidget):
         self.parts_table.setItemDelegateForColumn(PART_THICKNESS_COL, ThicknessSpinDelegate(self.parts_table))
         self.parts_table.setItemDelegateForColumn(PART_QTY_COL, QtySpinDelegate(self.parts_table))
         self.parts_table.setItemDelegateForColumn(PART_UNIT_COL, UnitComboDelegate(self.parts_table))
+        for column in PART_HIDDEN_COLUMNS:
+            self.parts_table.setColumnHidden(column, True)
         self.parts_table.itemChanged.connect(self._on_part_item_changed)
         detail_layout.addWidget(self.parts_table, 1)
 
