@@ -182,6 +182,81 @@ def test_material_choices_reads_rules_and_excludes_ftq(tmp_path: Path, monkeypat
     assert len([c for c in choices if c.casefold() == "aluminum 5052"]) == 1
 
 
+def _write_shop_csvs(directory: Path, descriptions: list[str], rules: list[tuple[str, str, str, str]]) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "expected_laser_descriptions.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["Description"])
+        for description in descriptions:
+            writer.writerow([description])
+    with (directory / "description_rules.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["Description", "Material", "Thickness", "Strategy"])
+        for row in rules:
+            writer.writerow(list(row))
+
+
+def test_catalog_offers_only_thicknesses_valid_for_each_material(tmp_path: Path, monkeypatch) -> None:
+    """expected_laser_descriptions.csv is authoritative: a material/thickness
+    pair the shop doesn't stock must not be selectable at all."""
+    shop = tmp_path / "inventor_to_radan"
+    _write_shop_csvs(
+        shop,
+        descriptions=[
+            'SHEET, AL ALY, .125" THK, 5052 H32',
+            'PLATE, AL ALY, .375" THK, 5052 H32',
+            'PLATE, MS, .375" THK, 44W',
+            'SHEET, AL ALY, .125" THK, 3003 H22 APT FTQ',
+        ],
+        rules=[
+            ('SHEET, AL ALY, .125" THK, 5052 H32', "Aluminum 5052", "0.12", "Air"),
+            ('PLATE, AL ALY, .375" THK, 5052 H32', "Aluminum 5052", "0.38", "Air"),
+            ('PLATE, MS, .375" THK, 44W', "Mild Steel-A36", "0.375", "O2"),
+            ('SHEET, AL ALY, .125" THK, 3003 H22 APT FTQ', "Aluminum 3003 CHK FTQ", "0.18", "Air"),
+            # Present in the rules but NOT in the expected list - must not be offered.
+            ("PLATE, SS, .25 THK, 304", "Stainless Steel", "0.25", "N2"),
+        ],
+    )
+    monkeypatch.setattr(job_intake_service, "INVENTOR_TO_RADAN_DIR", shop)
+
+    assert job_intake_service.material_choices() == ("Aluminum 5052", "Mild Steel-A36")
+    # Stainless has a rule but no expected description, so it doesn't exist here.
+    assert "Stainless Steel" not in job_intake_service.material_choices()
+    # FTQ is a forced per-part override elsewhere, never a user choice.
+    assert not any("FTQ" in material for material in job_intake_service.material_choices())
+
+    assert job_intake_service.thickness_choices("Aluminum 5052") == (0.12, 0.38)
+    assert job_intake_service.thickness_choices("Mild Steel-A36") == (0.375,)
+    # 0.375 is valid for steel but must not be offered for aluminium.
+    assert 0.375 not in job_intake_service.thickness_choices("Aluminum 5052")
+    assert job_intake_service.thickness_choices("nothing like this") == ()
+
+
+def test_catalog_picks_up_materials_added_after_launch(tmp_path: Path, monkeypatch) -> None:
+    """The shop edits this CSV; new materials must appear without a restart,
+    so nothing may be cached at import time."""
+    shop = tmp_path / "inventor_to_radan"
+    _write_shop_csvs(
+        shop,
+        descriptions=['PLATE, MS, .375" THK, 44W'],
+        rules=[('PLATE, MS, .375" THK, 44W', "Mild Steel-A36", "0.375", "O2")],
+    )
+    monkeypatch.setattr(job_intake_service, "INVENTOR_TO_RADAN_DIR", shop)
+    assert job_intake_service.material_choices() == ("Mild Steel-A36",)
+
+    # The shop adds a material mid-session.
+    _write_shop_csvs(
+        shop,
+        descriptions=['PLATE, MS, .375" THK, 44W', "PLATE, SS, .25 THK, 304"],
+        rules=[
+            ('PLATE, MS, .375" THK, 44W', "Mild Steel-A36", "0.375", "O2"),
+            ("PLATE, SS, .25 THK, 304", "Stainless Steel", "0.25", "N2"),
+        ],
+    )
+    assert job_intake_service.material_choices() == ("Mild Steel-A36", "Stainless Steel")
+    assert job_intake_service.thickness_choices("Stainless Steel") == (0.25,)
+
+
 def test_material_choices_falls_back_when_rules_missing(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(job_intake_service, "INVENTOR_TO_RADAN_DIR", tmp_path / "missing")
     assert material_choices() == job_intake_service.FALLBACK_MATERIALS

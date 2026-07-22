@@ -74,39 +74,100 @@ PART_HIDDEN_COLUMNS = (PART_UNIT_COL, PART_STRATEGY_COL)
 POLL_INTERVAL_MS = 4000
 
 
+def _widen_popup(combo: QComboBox, extra_px: int = 48) -> None:
+    """Size the drop-down list to its longest entry.
+
+    Qt sizes a combo's popup to the *cell* by default, which in a narrow
+    grid column truncates shop descriptions to uselessness. Measure the
+    items and widen the view itself.
+    """
+    metrics = combo.fontMetrics()
+    widest = max(
+        (metrics.horizontalAdvance(combo.itemText(i)) for i in range(combo.count())),
+        default=0,
+    )
+    combo.view().setMinimumWidth(widest + extra_px)
+    combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+
+
 class MaterialComboDelegate(QStyledItemDelegate):
+    """Materials the shop's expected_laser_descriptions.csv allows.
+
+    Not editable: that file is authoritative, so a material that isn't in it
+    doesn't exist. The list is re-read every time an editor opens, so edits to
+    the CSV take effect without restarting.
+    """
+
     def createEditor(self, parent, option, index):
         combo = QComboBox(parent)
-        combo.setEditable(True)
         combo.addItem("")
         for material in job_intake_service.material_choices():
             combo.addItem(material)
-        combo.setInsertPolicy(QComboBox.NoInsert)
+
+        # An entry saved before the CSV changed would otherwise be silently
+        # replaced by whatever sits first in the list. Keep it selectable and
+        # mark it, so the stale value is visible rather than lost.
+        current = str(index.data(Qt.EditRole) or "").strip()
+        if current and combo.findText(current) < 0:
+            combo.addItem(f"{current}  (not in current list)")
+
+        _widen_popup(combo)
         return combo
 
     def setEditorData(self, editor, index):
-        editor.setCurrentText(str(index.data(Qt.EditRole) or ""))
+        current = str(index.data(Qt.EditRole) or "")
+        position = editor.findText(current)
+        if position < 0:
+            position = editor.findText(f"{current}  (not in current list)")
+        editor.setCurrentIndex(max(0, position))
 
     def setModelData(self, editor, model, index):
-        model.setData(index, editor.currentText(), Qt.EditRole)
+        model.setData(index, editor.currentText().split("  (not in")[0], Qt.EditRole)
 
 
-class ThicknessSpinDelegate(QStyledItemDelegate):
+class ThicknessComboDelegate(QStyledItemDelegate):
+    """Thicknesses valid for this row's material, per the same CSV.
+
+    Cascades off the Material cell, so a material/thickness pair the shop
+    doesn't stock can't be chosen at all.
+    """
+
     def createEditor(self, parent, option, index):
-        spin = QDoubleSpinBox(parent)
-        spin.setDecimals(3)
-        spin.setRange(0.0, 12.0)
-        spin.setSingleStep(0.01)
-        return spin
+        combo = QComboBox(parent)
+        material = ""
+        model = index.model()
+        material_index = model.index(index.row(), PART_MATERIAL_COL)
+        if material_index.isValid():
+            material = str(material_index.data(Qt.EditRole) or "").strip()
+
+        combo.addItem("")
+        for thickness in job_intake_service.thickness_choices(material):
+            combo.addItem(f"{thickness:g}")
+
+        if combo.count() == 1:
+            # No material chosen yet, or one the CSV no longer covers.
+            combo.addItem("— pick a material first —")
+            combo.model().item(1).setEnabled(False)
+
+        current = str(index.data(Qt.EditRole) or "").strip()
+        if current and current not in ("0", "0.0") and combo.findText(current) < 0:
+            combo.addItem(f"{current}  (not in current list)")
+
+        _widen_popup(combo)
+        return combo
 
     def setEditorData(self, editor, index):
-        try:
-            editor.setValue(float(index.data(Qt.EditRole) or 0.0))
-        except (TypeError, ValueError):
-            editor.setValue(0.0)
+        current = str(index.data(Qt.EditRole) or "").strip()
+        position = editor.findText(current)
+        if position < 0:
+            position = editor.findText(f"{current}  (not in current list)")
+        editor.setCurrentIndex(max(0, position))
 
     def setModelData(self, editor, model, index):
-        model.setData(index, f"{editor.value():g}", Qt.EditRole)
+        text = editor.currentText().split("  (not in")[0].strip()
+        if text.startswith("—"):
+            return
+        model.setData(index, text, Qt.EditRole)
 
 
 class QtySpinDelegate(QStyledItemDelegate):
@@ -309,7 +370,7 @@ class JobIntakePage(QWidget):
         self.parts_table.verticalHeader().setVisible(False)
         self.parts_table.setAlternatingRowColors(True)
         self.parts_table.setItemDelegateForColumn(PART_MATERIAL_COL, MaterialComboDelegate(self.parts_table))
-        self.parts_table.setItemDelegateForColumn(PART_THICKNESS_COL, ThicknessSpinDelegate(self.parts_table))
+        self.parts_table.setItemDelegateForColumn(PART_THICKNESS_COL, ThicknessComboDelegate(self.parts_table))
         self.parts_table.setItemDelegateForColumn(PART_QTY_COL, QtySpinDelegate(self.parts_table))
         self.parts_table.setItemDelegateForColumn(PART_UNIT_COL, UnitComboDelegate(self.parts_table))
         for column in PART_HIDDEN_COLUMNS:
@@ -478,9 +539,29 @@ class JobIntakePage(QWidget):
     def _on_part_item_changed(self, item: QTableWidgetItem) -> None:
         if self._loading_detail or item.column() != PART_MATERIAL_COL:
             return
+        material = item.text()
         strategy_item = self.parts_table.item(item.row(), PART_STRATEGY_COL)
         if strategy_item is not None:
-            strategy_item.setText(job_intake_service.default_strategy_for_material(item.text()))
+            strategy_item.setText(job_intake_service.default_strategy_for_material(material))
+
+        # Changing material can invalidate the thickness already in the row -
+        # 0.375 is fine for Mild Steel but isn't offered for Aluminum 5052.
+        # Clear it rather than carry a combination the shop doesn't stock into
+        # the import CSV, where it would only surface as a RADAN failure.
+        thickness_item = self.parts_table.item(item.row(), PART_THICKNESS_COL)
+        if thickness_item is None:
+            return
+        current = thickness_item.text().strip()
+        if not current or current in ("0", "0.0"):
+            return
+        allowed = {f"{value:g}" for value in job_intake_service.thickness_choices(material)}
+        if current not in allowed:
+            self.parts_table.blockSignals(True)
+            thickness_item.setText("")
+            self.parts_table.blockSignals(False)
+            self.activity_label.setText(
+                f"Thickness cleared - {current} isn't available for {material}."
+            )
 
     def _collect_detail_fields(self) -> dict[str, Any]:
         parts: list[dict[str, Any]] = []

@@ -288,22 +288,113 @@ def clone_rpd_template(paths: JobPaths, template_path: Path = EXPLORER_TEMPLATE_
 # --- Material list -----------------------------------------------------------
 
 
-def material_choices() -> tuple[str, ...]:
-    """Distinct materials seen in inventor_to_radan's rule table, minus the
-    FTQ variant (a forced per-part override elsewhere, not a user choice)."""
-    rules_path = INVENTOR_TO_RADAN_DIR / "description_rules.csv"
-    seen: dict[str, str] = {}
+EXPECTED_DESCRIPTIONS_FILENAME = "expected_laser_descriptions.csv"
+DESCRIPTION_RULES_FILENAME = "description_rules.csv"
+
+
+# Resolved at call time, not as module-level constants. Binding these at
+# import would freeze the directory (defeating monkeypatching in tests) and,
+# more importantly, is the same class of bug the registry invariant warns
+# about. Everything below re-reads from disk on every call so that materials
+# added to the shop's CSV appear without restarting anything.
+def _expected_descriptions_path() -> Path:
+    return INVENTOR_TO_RADAN_DIR / EXPECTED_DESCRIPTIONS_FILENAME
+
+
+def _description_rules_path() -> Path:
+    return INVENTOR_TO_RADAN_DIR / DESCRIPTION_RULES_FILENAME
+
+
+def _read_expected_descriptions() -> list[str]:
+    """The shop's authoritative list of laser descriptions.
+
+    If a description isn't in this file it doesn't exist as far as intake is
+    concerned. The file is maintained outside this repo and changes, so it is
+    read on demand rather than cached at import.
+    """
+    descriptions: list[str] = []
     try:
-        with rules_path.open(newline="", encoding="utf-8-sig") as handle:
+        with _expected_descriptions_path().open(newline="", encoding="utf-8-sig") as handle:
             for row in csv.DictReader(handle):
-                material = str(row.get("Material", "") or "").strip()
-                if material and "FTQ" not in material.upper():
-                    seen.setdefault(material.casefold(), material)
+                text = str(row.get("Description", "") or "").strip()
+                if text:
+                    descriptions.append(text)
     except OSError:
-        pass
-    if not seen:
-        return FALLBACK_MATERIALS
-    return tuple(sorted(seen.values(), key=str.casefold))
+        return []
+    return descriptions
+
+
+def _read_description_rules() -> dict[str, dict[str, Any]]:
+    """description -> {material, thickness, strategy}, keyed for lookup.
+
+    This file translates a description into the values RADAN needs; the
+    expected-descriptions file decides which of them are offered.
+    """
+    rules: dict[str, dict[str, Any]] = {}
+    try:
+        with _description_rules_path().open(newline="", encoding="utf-8-sig") as handle:
+            for row in csv.DictReader(handle):
+                description = str(row.get("Description", "") or "").strip()
+                material = str(row.get("Material", "") or "").strip()
+                if not description or not material:
+                    continue
+                try:
+                    thickness = float(str(row.get("Thickness", "") or "").strip())
+                except ValueError:
+                    continue
+                if thickness <= 0:
+                    continue
+                rules[_normalize_match_key(description)] = {
+                    "material": material,
+                    "thickness": thickness,
+                    "strategy": str(row.get("Strategy", "") or "").strip(),
+                }
+    except OSError:
+        return {}
+    return rules
+
+
+def material_thickness_catalog() -> dict[str, tuple[float, ...]]:
+    """material -> the thicknesses actually available for it, ascending.
+
+    Built by taking every description the shop says is valid and translating
+    it through the rules table. A material/thickness pair the shop doesn't
+    stock therefore can't be picked at all, which is the point.
+
+    Read fresh on every call: both CSVs are maintained outside this repo and
+    are expected to change, so the grid must reflect the file as it is now
+    rather than as it was at import time.
+    """
+    rules = _read_description_rules()
+    catalog: dict[str, set[float]] = {}
+    for description in _read_expected_descriptions():
+        rule = rules.get(_normalize_match_key(description))
+        if rule is None:
+            continue
+        material = str(rule["material"])
+        # FTQ is a forced per-part override elsewhere (ftq_parts.csv), never a
+        # choice the user makes here.
+        if "FTQ" in material.upper():
+            continue
+        catalog.setdefault(material, set()).add(float(rule["thickness"]))
+
+    if not catalog:
+        # The files are missing or reshaped; fall back so intake still works.
+        return {material: () for material in FALLBACK_MATERIALS}
+    return {
+        material: tuple(sorted(thicknesses))
+        for material, thicknesses in sorted(catalog.items(), key=lambda pair: pair[0].casefold())
+    }
+
+
+def material_choices() -> tuple[str, ...]:
+    """Materials the shop's expected-descriptions file actually allows."""
+    return tuple(material_thickness_catalog().keys())
+
+
+def thickness_choices(material: str) -> tuple[float, ...]:
+    """Thicknesses available for one material, per the expected descriptions."""
+    return material_thickness_catalog().get(str(material or "").strip(), ())
 
 
 def default_strategy_for_material(material: str) -> str:
