@@ -1,0 +1,36 @@
+"""Shop paths and constants for odd_job_intake.
+
+Standalone version of the handful of constants this feature used while it
+lived inside master_app's ops_paths.py. Kept in one place so both the desktop
+page and the (planned) Outlook-facing listener resolve identical locations.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+
+APP_DIR = Path(__file__).resolve().parent
+TOOLS_DIR = Path(os.environ.get("ODD_JOB_INTAKE_TOOLS_DIR", r"C:\Tools"))
+
+# Sibling apps this feature borrows behavior from at runtime.
+TRUCK_NEST_EXPLORER_DIR = TOOLS_DIR / "truck_nest_explorer"
+INVENTOR_TO_RADAN_DIR = TOOLS_DIR / "inventor_to_radan"
+
+# The blank RADAN project cloned for each new job.
+EXPLORER_TEMPLATE_PATH = TRUCK_NEST_EXPLORER_DIR / "Template" / "Template.rpd"
+
+# One-off jobs live under the shop's existing L: roots, chosen by the job
+# number's prefix letter - never a new root folder.
+BATTLESHIELD_ROOT = Path(r"L:\BATTLESHIELD")
+MACHINE_EIA_BATTLESHIELD_ROOT = Path(r"A:\EiaFiles\Battleshield")
+JOB_PREFIX_TO_ROOT = {
+    "F": "F-LARGE FLEET",
+    "P": "P-SMALL FLEET",
+    "M": "M-FABRICATION",
+    "W": "W-WARRANTY",
+    "S": "S-SERVICE",
+}
+
+JOB_INTAKE_REGISTRY_PATH = APP_DIR / "_runtime" / "job_intake_registry.json"
