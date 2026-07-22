@@ -62,7 +62,10 @@ PART_QTY_COL = 3
 PART_UNIT_COL = 4
 PART_STRATEGY_COL = 5
 PART_PO_REF_COL = 6
-PART_COLUMNS = ("DXF", "Material", "Thickness", "Qty", "Unit", "Strategy", "PO Ref")
+PART_DXF_REF_COL = 7
+PART_COLUMNS = (
+    "DXF", "Material", "Thickness", "Qty", "Unit", "Strategy", "PO Ref", "Drawing Text",
+)
 
 # Kept in the model but hidden from the grid. Neither is a real decision the
 # user makes: Unit is always "in" here, and Strategy is derived from Material.
@@ -524,11 +527,21 @@ class JobIntakePage(QWidget):
                         str(part.get("unit", "") or "in"),
                         str(part.get("strategy", "") or ""),
                         str(part.get("po_ref", "") or ""),
+                        str(part.get("dxf_ref", "") or ""),
                     )
                     for column, value in enumerate(values):
                         item = QTableWidgetItem(value)
-                        if column in (PART_DXF_COL, PART_STRATEGY_COL, PART_PO_REF_COL):
+                        if column in (
+                            PART_DXF_COL,
+                            PART_STRATEGY_COL,
+                            PART_PO_REF_COL,
+                            PART_DXF_REF_COL,
+                        ):
                             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                        # Reference columns can be long; show the full text on
+                        # hover rather than widening the grid for them.
+                        if column in (PART_PO_REF_COL, PART_DXF_REF_COL) and value:
+                            item.setToolTip(value)
                         self.parts_table.setItem(row, column, item)
             finally:
                 self.parts_table.blockSignals(False)

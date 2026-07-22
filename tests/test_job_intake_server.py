@@ -103,6 +103,9 @@ def test_submit_creates_folder_and_registry_entry_with_outlook_source(client) ->
             "unit": "in",
             "strategy": "",
             "po_ref": "",
+            # This DXF is a stub with no TEXT entities, so the drawing-text
+            # fallback contributes nothing - the normal case.
+            "dxf_ref": "",
         }
     ]
 

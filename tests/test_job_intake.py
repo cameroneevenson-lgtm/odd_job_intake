@@ -257,6 +257,168 @@ def test_catalog_picks_up_materials_added_after_launch(tmp_path: Path, monkeypat
     assert job_intake_service.thickness_choices("Stainless Steel") == (0.25,)
 
 
+def _dxf_with_text(path: Path, *texts: str) -> Path:
+    """A minimal DXF carrying TEXT entities in the real group-code layout:
+    each value is preceded by its group code on its own line, and entity text
+    is code 1."""
+    lines = ["0", "SECTION", "2", "ENTITIES"]
+    for text in texts:
+        lines += ["0", "TEXT", "8", "NOTES", "1", text]
+    lines += ["0", "ENDSEC", "0", "EOF"]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+@pytest.fixture()
+def shop_csvs(tmp_path: Path, monkeypatch) -> Path:
+    shop = tmp_path / "inventor_to_radan"
+    _write_shop_csvs(
+        shop,
+        descriptions=[
+            'SHEET, AL ALY, .125" THK, 5052 H32',
+            'PLATE, AL ALY, .25" THK, 5052 H32',
+            'PLATE, MS, .375" THK, 44W',
+        ],
+        rules=[
+            ('SHEET, AL ALY, .125" THK, 5052 H32', "Aluminum 5052", "0.12", "Air"),
+            ('PLATE, AL ALY, .25" THK, 5052 H32', "Aluminum 5052", "0.25", "Air"),
+            ('PLATE, MS, .375" THK, 44W', "Mild Steel-A36", "0.375", "O2"),
+        ],
+    )
+    monkeypatch.setattr(job_intake_service, "INVENTOR_TO_RADAN_DIR", shop)
+    return shop
+
+
+def test_dxf_hints_read_qty_material_and_thickness_from_drawing_text(tmp_path, shop_csvs) -> None:
+    path = _dxf_with_text(
+        tmp_path / "Gusset.dxf",
+        "GUSSET PLATE",
+        "MATERIAL: 5052 ALUMINUM",
+        'QTY: 4',
+        '1/4" THK',
+    )
+    hints = job_intake_service.extract_dxf_hints(path)
+
+    assert hints.material == "Aluminum 5052"
+    assert hints.qty == 4
+    # 1/4 -> 0.25, which the shop stocks for this material.
+    assert hints.thickness == 0.25
+    assert any("QTY" in line for line in hints.raw_lines)
+
+
+def test_dxf_hints_accept_the_other_qty_wording(tmp_path, shop_csvs) -> None:
+    hints = job_intake_service.extract_dxf_hints(
+        _dxf_with_text(tmp_path / "Clip.dxf", "2 OFF", "MILD STEEL 44W")
+    )
+    assert hints.qty == 2
+    assert hints.material == "Mild Steel-A36"
+
+
+def test_dxf_hints_stay_silent_when_the_material_is_ambiguous(tmp_path, shop_csvs) -> None:
+    """Material stays the user's choice unless the drawing names exactly one
+    material the shop stocks - naming two must not pick a winner."""
+    hints = job_intake_service.extract_dxf_hints(
+        _dxf_with_text(tmp_path / "Mixed.dxf", "5052 ALUMINUM OR 44W MILD STEEL", "QTY: 3")
+    )
+    assert hints.material is None
+    assert hints.thickness is None      # no material -> no thickness claim
+    assert hints.qty == 3               # qty is unambiguous, so it still counts
+
+
+def test_dxf_hints_reject_a_thickness_the_shop_does_not_stock(tmp_path, shop_csvs) -> None:
+    """0.5 is not offered for Aluminum 5052 here, so claiming it would only
+    fail RADAN's import later."""
+    hints = job_intake_service.extract_dxf_hints(
+        _dxf_with_text(tmp_path / "Thick.dxf", "5052 ALUMINUM", '1/2" THK')
+    )
+    assert hints.material == "Aluminum 5052"
+    assert hints.thickness is None
+
+
+def test_a_bare_dimension_is_not_mistaken_for_a_material(tmp_path, monkeypatch) -> None:
+    """Regression: the real shop file contains `5052 H32 >80"`, whose "80" was
+    harvested as an Aluminum token - so any 80mm dimension on a drawing
+    claimed aluminium. Numeric tokens must be long enough to be a grade."""
+    shop = tmp_path / "inventor_to_radan"
+    _write_shop_csvs(
+        shop,
+        descriptions=['PLATE, AL ALY, .188" THK, 5052 H32 >80"'],
+        rules=[('PLATE, AL ALY, .188" THK, 5052 H32 >80"', "Aluminum 5052", "0.18", "Air")],
+    )
+    monkeypatch.setattr(job_intake_service, "INVENTOR_TO_RADAN_DIR", shop)
+
+    assert "80" not in job_intake_service._material_tokens()
+    assert job_intake_service._match_material_in_text("PART IS 80 X 120") is None
+    # The real grade still matches.
+    assert job_intake_service._match_material_in_text("MATERIAL 5052") == "Aluminum 5052"
+
+
+def test_dxf_hints_tolerate_a_drawing_with_nothing_useful(tmp_path, shop_csvs) -> None:
+    empty = tmp_path / "Plain.dxf"
+    empty.write_text("0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n", encoding="utf-8")
+    hints = job_intake_service.extract_dxf_hints(empty)
+    assert (hints.material, hints.thickness, hints.qty) == (None, None, None)
+
+    missing = job_intake_service.extract_dxf_hints(tmp_path / "does_not_exist.dxf")
+    assert (missing.material, missing.qty) == (None, None)
+
+
+def test_dxf_hints_strip_mtext_formatting_codes(tmp_path, shop_csvs) -> None:
+    """MTEXT wraps text in formatting markup; the words must survive it."""
+    hints = job_intake_service.extract_dxf_hints(
+        _dxf_with_text(tmp_path / "Fmt.dxf", r"{\fArial|b1;MATERIAL: 44W} \pxqc;QTY: 6")
+    )
+    assert hints.material == "Mild Steel-A36"
+    assert hints.qty == 6
+
+
+def test_po_qty_wins_over_the_drawing(tmp_path, monkeypatch, shop_csvs) -> None:
+    """The DXF fallback fills gaps; it never overrides what the PO said."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    monkeypatch.setattr(
+        job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
+    )
+    source = _dxf_with_text(tmp_path / "Bracket.dxf", "QTY: 9", "44W MILD STEEL")
+
+    monkeypatch.setattr(
+        job_intake_service,
+        "extract_po_hints",
+        lambda *_args, **_kwargs: job_intake_service.POHints(
+            po_number="8497-005",
+            due_date=None,
+            due_note=None,
+            line_items={"Bracket": {"qty": 25, "raw_description": "Bracket - 3/8 Mild Steel"}},
+            unmatched_lines=(),
+        ),
+    )
+    pdf = tmp_path / "po.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+
+    entry = job_intake_service.create_intake("M50123", None, [source, pdf])
+    part = entry["material_qty"][0]
+
+    assert part["qty"] == 25                       # PO wins
+    assert part["material"] == "Mild Steel-A36"    # drawing filled the gap
+    assert part["strategy"] == "O2"
+    assert "QTY: 9" in part["dxf_ref"]             # what the drawing said, for reference
+
+
+def test_drawing_qty_used_when_there_is_no_po(tmp_path, monkeypatch, shop_csvs) -> None:
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    monkeypatch.setattr(
+        job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
+    )
+    source = _dxf_with_text(tmp_path / "Panel.dxf", "QTY: 7", "5052 ALUMINUM", '1/4" THK')
+
+    entry = job_intake_service.create_intake("M50124", None, [source])
+    part = entry["material_qty"][0]
+
+    assert part["qty"] == 7
+    assert part["material"] == "Aluminum 5052"
+    assert part["thickness"] == 0.25
+    assert part["strategy"] == "Air"
+
+
 def test_material_choices_falls_back_when_rules_missing(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(job_intake_service, "INVENTOR_TO_RADAN_DIR", tmp_path / "missing")
     assert material_choices() == job_intake_service.FALLBACK_MATERIALS

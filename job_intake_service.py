@@ -204,18 +204,37 @@ def create_intake(
             line_items.setdefault(stem, hint)
         unmatched.extend(line for line in hints.unmatched_lines if line not in unmatched)
 
+    attachment_paths = {
+        str(attachment["filename"]): Path(str(attachment["saved_path"]))
+        for attachment in attachments
+    }
+
     material_qty = []
     for name in dxf_names:
         hint = line_items.get(Path(name).stem, {})
+        po_qty = hint.get("qty")
+
+        # Second pass over the DXF's own text. The PO always wins where it
+        # said something; this only fills gaps, which is the common case for
+        # jobs emailed without a PO at all.
+        dxf_hints = extract_dxf_hints(attachment_paths[name])
+
         material_qty.append(
             {
                 "filename": name,
-                "material": "",
-                "thickness": 0.0,
-                "qty": int(hint.get("qty") or 1),
+                "material": dxf_hints.material or "",
+                "thickness": dxf_hints.thickness or 0.0,
+                "qty": int(po_qty or dxf_hints.qty or 1),
                 "unit": "in",
-                "strategy": "",
+                "strategy": (
+                    default_strategy_for_material(dxf_hints.material)
+                    if dxf_hints.material
+                    else ""
+                ),
                 "po_ref": str(hint.get("raw_description", "") or ""),
+                # Shown as reference so the user can see what the drawing said,
+                # the same way po_ref shows what the PO said.
+                "dxf_ref": " | ".join(dxf_hints.raw_lines),
             }
         )
 
@@ -542,6 +561,216 @@ def extract_po_hints(pdf_path: Path, dxf_stems: list[str]) -> POHints:
         line_items=line_items,
         unmatched_lines=tuple(dict.fromkeys(unmatched)),
     )
+
+
+# --- DXF text extraction (fallback when the PO gives nothing) ----------------
+#
+# Second-best source for qty/material after the PO, and the only one available
+# when a DXF arrives with no accompanying document. Text in the drawing is the
+# designer's own value rather than a salesperson's retyping, so where it is
+# unambiguous it is more trustworthy than the PO - but it is still best-effort
+# and never overrides anything the PO or the user supplied.
+
+
+@dataclass(frozen=True)
+class DXFHints:
+    material: str | None       # canonical, only when unambiguous
+    thickness: float | None    # only when it exists for that material
+    qty: int | None
+    # Every line that contributed, for the grid's reference column - so the
+    # user can see what the drawing actually said.
+    raw_lines: tuple[str, ...] = ()
+
+
+# 12MB covers the shop's DXFs comfortably; the cap just stops a pathological
+# file from being slurped into memory during intake.
+_DXF_READ_LIMIT = 12 * 1024 * 1024
+
+_DXF_QTY_PATTERN = re.compile(
+    r"\b(?:QTY|QUANTITY|REQD|REQUIRED)\b\s*[:.\-]?\s*(\d{1,4})\b", re.IGNORECASE
+)
+# "2 OFF", "4 PLCS", "3 REQ'D"
+_DXF_QTY_SUFFIX_PATTERN = re.compile(
+    r"\b(\d{1,4})\s*(?:OFF|PLCS?|PCS?|REQ'?D)\b", re.IGNORECASE
+)
+_DXF_THICKNESS_PATTERN = re.compile(
+    r"(\d+(?:\.\d+)?|\d+\s*/\s*\d+)\s*(?:\"|IN\b|INCH)?\s*(?:THK|THICK)", re.IGNORECASE
+)
+
+
+def _dxf_text_values(dxf_path: Path) -> list[str]:
+    """Text carried by TEXT/MTEXT entities.
+
+    DXF is line-pairs of group code then value; codes 1 and 3 hold entity text.
+    Reading the codes directly avoids a CAD dependency for what is a flat scan.
+    """
+    try:
+        raw = dxf_path.read_bytes()[:_DXF_READ_LIMIT]
+    except OSError:
+        return []
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        # DXFs are commonly cp1252; latin-1 never fails and preserves bytes.
+        text = raw.decode("latin-1", errors="replace")
+
+    lines = text.splitlines()
+    values: list[str] = []
+    for index in range(0, len(lines) - 1):
+        code = lines[index].strip()
+        if code in ("1", "3"):
+            value = lines[index + 1].strip()
+            # MTEXT carries formatting codes like \pxqc; \fArial|b0; - strip
+            # them so the words survive but the markup doesn't.
+            value = re.sub(r"\\[A-Za-z][^;\\]*;?", " ", value)
+            value = re.sub(r"[{}]", " ", value)
+            value = re.sub(r"\s+", " ", value).strip()
+            if value:
+                values.append(value)
+    return values
+
+
+# Structural words shared by every description; they identify no material.
+_DESCRIPTION_STOPWORDS = frozenset(
+    {"plate", "sheet", "thk", "thick", "general", "inch", "steel", "aly"}
+)
+
+
+def _material_tokens() -> dict[str, str]:
+    """token -> material, for tokens that identify exactly one material.
+
+    Built from the expected descriptions rather than the canonical material
+    names, because drawings use the shop's grade wording ("44W", "5052") and
+    never the canonical string ("Mild Steel-A36"). Tokens shared by more than
+    one material are dropped, so an ambiguous word can never decide.
+
+    The thickness field is excluded: descriptions are comma-separated and the
+    thickness sits in the field containing "THK", so `.125"` would otherwise
+    contribute a "125" token that a stray dimension on a drawing could match.
+    """
+    rules = _read_description_rules()
+    candidates: dict[str, set[str]] = {}
+
+    def _add(token: str, material: str) -> None:
+        token = token.casefold()
+        if len(token) < 2 or token in _DESCRIPTION_STOPWORDS:
+            return
+        # Purely numeric tokens are only grade designations when they're long
+        # enough (5052, 3003, 304). Shorter ones are size qualifiers - the
+        # real file's `5052 H32 >80"` yields an "80" that any 80mm dimension
+        # on a drawing would otherwise match.
+        if token.isdigit() and len(token) < 3:
+            return
+        candidates.setdefault(token, set()).add(material)
+
+    for description in _read_expected_descriptions():
+        rule = rules.get(_normalize_match_key(description))
+        if rule is None:
+            continue
+        material = str(rule["material"])
+        if "FTQ" in material.upper():
+            continue
+        for field in description.split(","):
+            if "THK" in field.upper() or "THICK" in field.upper():
+                continue
+            for token in re.findall(r"[A-Za-z0-9]+", field):
+                _add(token, material)
+        # The canonical name's own distinctive words too ("A36").
+        for token in re.findall(r"[A-Za-z0-9]+", material):
+            if len(token) >= 3:
+                _add(token, material)
+
+    return {
+        token: next(iter(materials))
+        for token, materials in candidates.items()
+        if len(materials) == 1
+    }
+
+
+def _match_material_in_text(text: str) -> str | None:
+    """Canonical material for this text, only when exactly one matches.
+
+    Deliberately conservative. The standing rule is that material stays the
+    user's choice because wording is inconsistent; auto-filling is only
+    defensible when the drawing points at exactly one material the shop
+    actually stocks. Anything ambiguous returns None and stays manual.
+    """
+    words = {word.casefold() for word in re.findall(r"[A-Za-z0-9]+", str(text or ""))}
+    if not words:
+        return None
+
+    matches = {
+        material for token, material in _material_tokens().items() if token in words
+    }
+    if len(matches) == 1:
+        return matches.pop()
+    return None
+
+
+def _parse_fraction_or_number(text: str) -> float | None:
+    cleaned = str(text or "").strip()
+    if "/" in cleaned:
+        parts = [part.strip() for part in cleaned.split("/", 1)]
+        try:
+            numerator, denominator = float(parts[0]), float(parts[1])
+        except (ValueError, IndexError):
+            return None
+        if denominator == 0:
+            return None
+        # The shop's convention is the fraction rounded to 2dp
+        # (1/8 -> 0.12, 3/8 -> 0.38) - Python's default round matches.
+        return round(numerator / denominator, 2)
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def extract_dxf_hints(dxf_path: Path) -> DXFHints:
+    """Best-effort qty/material/thickness from a DXF's own text.
+
+    Every step degrades to None rather than raising: a drawing with no useful
+    text simply contributes nothing, which is the normal case.
+    """
+    values = _dxf_text_values(Path(dxf_path))
+    if not values:
+        return DXFHints(material=None, thickness=None, qty=None)
+
+    joined = " | ".join(values)
+    material = _match_material_in_text(joined)
+
+    qty: int | None = None
+    for pattern in (_DXF_QTY_PATTERN, _DXF_QTY_SUFFIX_PATTERN):
+        match = pattern.search(joined)
+        if match is not None:
+            try:
+                candidate = int(match.group(1))
+            except ValueError:
+                candidate = 0
+            if 0 < candidate <= 9999:
+                qty = candidate
+                break
+
+    thickness: float | None = None
+    thickness_match = _DXF_THICKNESS_PATTERN.search(joined)
+    if thickness_match is not None:
+        thickness = _parse_fraction_or_number(thickness_match.group(1))
+    # Only keep a thickness the shop actually stocks for that material -
+    # otherwise it would fail RADAN's import later anyway.
+    if thickness is not None and material is not None:
+        if thickness not in thickness_choices(material):
+            thickness = None
+    elif thickness is not None and material is None:
+        thickness = None
+
+    contributing = tuple(
+        value for value in values
+        if _DXF_QTY_PATTERN.search(value)
+        or _DXF_QTY_SUFFIX_PATTERN.search(value)
+        or _DXF_THICKNESS_PATTERN.search(value)
+        or _match_material_in_text(value) is not None
+    )
+    return DXFHints(material=material, thickness=thickness, qty=qty, raw_lines=contributing)
 
 
 # --- RADAN import CSV --------------------------------------------------------
