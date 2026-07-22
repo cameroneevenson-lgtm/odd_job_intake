@@ -197,8 +197,13 @@ def _write_shop_csvs(directory: Path, descriptions: list[str], rules: list[tuple
 
 
 def test_catalog_offers_only_thicknesses_valid_for_each_material(tmp_path: Path, monkeypatch) -> None:
-    """expected_laser_descriptions.csv is authoritative: a material/thickness
-    pair the shop doesn't stock must not be selectable at all."""
+    """The catalog comes from description_rules.csv, and a material/thickness
+    pair it doesn't list must not be selectable.
+
+    expected_laser_descriptions.csv is deliberately not consulted - it lists a
+    far narrower set, and gating on it rejected 3003 checker plate that came
+    through a real customer BOM.
+    """
     shop = tmp_path / "inventor_to_radan"
     _write_shop_csvs(
         shop,
@@ -213,15 +218,18 @@ def test_catalog_offers_only_thicknesses_valid_for_each_material(tmp_path: Path,
             ('PLATE, AL ALY, .375" THK, 5052 H32', "Aluminum 5052", "0.38", "Air"),
             ('PLATE, MS, .375" THK, 44W', "Mild Steel-A36", "0.375", "O2"),
             ('SHEET, AL ALY, .125" THK, 3003 H22 APT FTQ', "Aluminum 3003 CHK FTQ", "0.18", "Air"),
-            # Present in the rules but NOT in the expected list - must not be offered.
+            # In the rules but not in the expected list - must still be offered,
+            # since the expected list is no longer a gate.
             ("PLATE, SS, .25 THK, 304", "Stainless Steel", "0.25", "N2"),
         ],
     )
     monkeypatch.setattr(job_intake_service, "INVENTOR_TO_RADAN_DIR", shop)
 
-    assert job_intake_service.material_choices() == ("Aluminum 5052", "Mild Steel-A36")
-    # Stainless has a rule but no expected description, so it doesn't exist here.
-    assert "Stainless Steel" not in job_intake_service.material_choices()
+    assert job_intake_service.material_choices() == (
+        "Aluminum 5052",
+        "Mild Steel-A36",
+        "Stainless Steel",
+    )
     # FTQ is a forced per-part override elsewhere, never a user choice.
     assert not any("FTQ" in material for material in job_intake_service.material_choices())
 

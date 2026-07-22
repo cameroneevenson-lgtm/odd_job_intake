@@ -542,6 +542,9 @@ def _read_description_rules() -> dict[str, dict[str, Any]]:
                 if thickness <= 0:
                     continue
                 rules[_normalize_match_key(description)] = {
+                    # Kept so callers can tokenise the shop's own wording -
+                    # the key is normalised beyond recognition.
+                    "description": description,
                     "material": material,
                     "thickness": thickness,
                     "strategy": str(row.get("Strategy", "") or "").strip(),
@@ -552,28 +555,41 @@ def _read_description_rules() -> dict[str, dict[str, Any]]:
 
 
 def material_thickness_catalog() -> dict[str, tuple[float, ...]]:
-    """material -> the thicknesses actually available for it, ascending.
+    """material -> the thicknesses available for it, ascending.
 
-    Built by taking every description the shop says is valid and translating
-    it through the rules table. A material/thickness pair the shop doesn't
-    stock therefore can't be picked at all, which is the point.
+    Built from description_rules.csv, which is the mapping the CAM side
+    actually uses. expected_laser_descriptions.csv is deliberately *not*
+    consulted: it lists a much narrower set (14 rows against 36) and gating on
+    it rejected materials that turn up in real BOMs - 3003 checker plate came
+    through a customer parts list and was refused for not being on that list.
 
-    Read fresh on every call: both CSVs are maintained outside this repo and
-    are expected to change, so the grid must reflect the file as it is now
-    rather than as it was at import time.
+    Read fresh on every call: the file is maintained outside this repo and is
+    expected to change, so the grid must reflect it as it is now rather than
+    as it was at import time.
     """
     rules = _read_description_rules()
-    catalog: dict[str, set[float]] = {}
-    for description in _read_expected_descriptions():
-        rule = rules.get(_normalize_match_key(description))
-        if rule is None:
-            continue
-        material = str(rule["material"])
+    # Grouped case-insensitively: the file spells the same material more than
+    # one way (it does the same with strategies - AIR vs Air), and two casings
+    # of one material would otherwise become two entries in the drop-down.
+    grouped: dict[str, set[float]] = {}
+    spellings: dict[str, dict[str, int]] = {}
+    for rule in rules.values():
+        material = str(rule["material"]).strip()
         # FTQ is a forced per-part override elsewhere (ftq_parts.csv), never a
         # choice the user makes here.
         if "FTQ" in material.upper():
             continue
-        catalog.setdefault(material, set()).add(float(rule["thickness"]))
+        key = material.casefold()
+        grouped.setdefault(key, set()).add(float(rule["thickness"]))
+        spellings.setdefault(key, {})
+        spellings[key][material] = spellings[key].get(material, 0) + 1
+
+    catalog: dict[str, set[float]] = {}
+    for key, thicknesses in grouped.items():
+        # The most common spelling wins, so the grid shows what the file mostly
+        # says rather than whichever row happened to be read first.
+        best = max(spellings[key].items(), key=lambda pair: pair[1])[0]
+        catalog[best] = thicknesses
 
     if not catalog:
         # The files are missing or reshaped; fall back so intake still works.
@@ -889,10 +905,10 @@ def _read_material_aliases() -> dict[str, str]:
 def _material_tokens() -> dict[str, str]:
     """token -> material, for tokens that identify exactly one material.
 
-    Built from the expected descriptions rather than the canonical material
-    names, because drawings use the shop's grade wording ("44W", "5052") and
-    never the canonical string ("Mild Steel-A36"). Tokens shared by more than
-    one material are dropped, so an ambiguous word can never decide.
+    Built from the rules table's descriptions rather than the canonical
+    material names, because drawings use the shop's grade wording ("44W",
+    "5052") and never the canonical string ("Mild Steel-A36"). Tokens shared by
+    more than one material are dropped, so an ambiguous word can never decide.
 
     The thickness field is excluded: descriptions are comma-separated and the
     thickness sits in the field containing "THK", so `.125"` would otherwise
@@ -901,22 +917,23 @@ def _material_tokens() -> dict[str, str]:
     rules = _read_description_rules()
     candidates: dict[str, set[str]] = {}
 
+    aliases = _read_material_aliases()
+
     def _add(token: str, material: str) -> None:
         token = token.casefold()
         if len(token) < 2 or token in _DESCRIPTION_STOPWORDS:
             return
-        # Purely numeric tokens are only grade designations when they're long
-        # enough (5052, 3003, 304). Shorter ones are size qualifiers - the
-        # real file's `5052 H32 >80"` yields an "80" that any 80mm dimension
-        # on a drawing would otherwise match.
-        if token.isdigit() and len(token) < 3:
+        # Only grade designations (5052, 3003, 304, A36, 44W) and words the
+        # alias file already recognises. Accepting any leftover word harvested
+        # "new", "tool" and "mm" out of the rules descriptions, so a drawing
+        # note saying NEW claimed an aluminium. Words belong in
+        # material_aliases.csv, where they are a deliberate choice.
+        if not _FINGERPRINT_GRADE.match(token) and token not in aliases:
             return
         candidates.setdefault(token, set()).add(material)
 
-    for description in _read_expected_descriptions():
-        rule = rules.get(_normalize_match_key(description))
-        if rule is None:
-            continue
+    for key, rule in rules.items():
+        description = str(rule.get("description", "") or "")
         material = str(rule["material"])
         if "FTQ" in material.upper():
             continue
