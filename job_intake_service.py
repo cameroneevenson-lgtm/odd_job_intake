@@ -567,6 +567,9 @@ def material_thickness_catalog() -> dict[str, tuple[float, ...]]:
     expected to change, so the grid must reflect it as it is now rather than
     as it was at import time.
     """
+    # Built from the de-duped Material/Thickness/Strategy columns. The
+    # Description column is only a lookup key - its wording varies per
+    # customer and it says nothing about what the shop stocks.
     rules = _read_description_rules()
     # Grouped case-insensitively: the file spells the same material more than
     # one way (it does the same with strategies - AIR vs Air), and two casings
@@ -905,47 +908,33 @@ def _read_material_aliases() -> dict[str, str]:
 def _material_tokens() -> dict[str, str]:
     """token -> material, for tokens that identify exactly one material.
 
-    Built from the rules table's descriptions rather than the canonical
-    material names, because drawings use the shop's grade wording ("44W",
-    "5052") and never the canonical string ("Mild Steel-A36"). Tokens shared by
-    more than one material are dropped, so an ambiguous word can never decide.
+    Column A (Description) is deliberately not read. It is only a lookup key
+    whose wording varies per customer, and tokenising it harvested "new",
+    "tool" and "mm" as if they identified materials - a drawing note reading
+    NEW then claimed an aluminium.
 
-    The thickness field is excluded: descriptions are comma-separated and the
-    thickness sits in the field containing "THK", so `.125"` would otherwise
-    contribute a "125" token that a stray dimension on a drawing could match.
+    The material names in column B already carry the grade ("Aluminum 5052" ->
+    5052, "Mild Steel-A36" -> a36). Anything else a drawing might say belongs
+    in material_aliases.csv, where it is a deliberate entry rather than an
+    accident of how somebody worded a description. Tokens shared by more than
+    one material are dropped, so an ambiguous word can never decide.
     """
-    rules = _read_description_rules()
     candidates: dict[str, set[str]] = {}
-
-    aliases = _read_material_aliases()
+    available = set(material_choices())
 
     def _add(token: str, material: str) -> None:
         token = token.casefold()
         if len(token) < 2 or token in _DESCRIPTION_STOPWORDS:
             return
-        # Only grade designations (5052, 3003, 304, A36, 44W) and words the
-        # alias file already recognises. Accepting any leftover word harvested
-        # "new", "tool" and "mm" out of the rules descriptions, so a drawing
-        # note saying NEW claimed an aluminium. Words belong in
-        # material_aliases.csv, where they are a deliberate choice.
-        if not _FINGERPRINT_GRADE.match(token) and token not in aliases:
-            return
         candidates.setdefault(token, set()).add(material)
 
-    for key, rule in rules.items():
-        description = str(rule.get("description", "") or "")
-        material = str(rule["material"])
-        if "FTQ" in material.upper():
-            continue
-        for field in description.split(","):
-            if "THK" in field.upper() or "THICK" in field.upper():
-                continue
-            for token in re.findall(r"[A-Za-z0-9]+", field):
-                _add(token, material)
-        # The canonical name's own distinctive words too ("A36").
+    for material in available:
         for token in re.findall(r"[A-Za-z0-9]+", material):
-            if len(token) >= 3:
-                _add(token, material)
+            _add(token, material)
+
+    for alias, material in _read_material_aliases().items():
+        if material in available:
+            _add(alias, material)
 
     return {
         token: next(iter(materials))
