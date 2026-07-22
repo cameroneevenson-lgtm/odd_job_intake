@@ -55,10 +55,13 @@ C:\Tools\.venv\Scripts\python.exe app.py
   sequence.** The desktop page passes `source="manual"`, the listener passes
   `source="outlook"`; they differ in nothing else. Don't inline the
   folder→copy→scrape→register steps into a caller again.
-- **The listener never triggers RADAN work.** It stages files and registers
-  the entry, then returns. RPD clone / part import / block transfer stay
-  desktop actions, so an Outlook request can't block on RADAN COM automation.
-  A test asserts no `.rpd` appears from a POST.
+- **The listener never triggers RADAN *automation*.** The line is the COM
+  conversion, not RADAN files. Cloning the blank project is text substitution
+  on a template — fast, local, and every one-off job needs one — so intake
+  does it and a filed job arrives at `rpd_created`. What must never happen in
+  a request is the slow interactive part: the DXF→parts COM import and the
+  block transfer, which would block the listener's thread. Those stay desktop
+  actions, and a test asserts no import CSV or log appears from a POST.
 - **Attachment names off the wire are untrusted** — reduced to a bare
   filename before being joined to any path under `L:`, and restricted to
   `.dxf`/`.pdf`. They come from an email.

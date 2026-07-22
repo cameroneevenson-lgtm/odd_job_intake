@@ -568,6 +568,17 @@ def create_intake(
     # Keep only paths that exist, and drop any that is merely a parent of
     # another kept one - the candidate list deliberately includes prefixes.
     existing = [path for path in paths_in_text(email_body) if Path(path).exists()]
+    # Every one-off job needs a blank project, so it is made now rather than
+    # waiting for a button. Non-fatal: if the template is missing or an RPD is
+    # somehow already there, the intake is still perfectly good and the desktop
+    # button can retry.
+    try:
+        entry_rpd_path = str(clone_rpd_template(paths))
+        entry_rpd_error = ""
+    except JobIntakeError as exc:
+        entry_rpd_path = ""
+        entry_rpd_error = str(exc)
+
     entry["ingested_from"] = ingested_from
     entry["source_paths"] = [
         path
@@ -581,6 +592,13 @@ def create_intake(
     entry["attachments"] = attachments
     entry["material_qty"] = material_qty
     entry["po_unmatched"] = unmatched
+    if entry_rpd_path:
+        entry["rpd_path"] = entry_rpd_path
+        entry["status"] = job_intake_registry.STATUS_RPD_CREATED
+    elif entry_rpd_error:
+        # Recorded rather than raised - the job folder and parts are fine, and
+        # this is retryable from the desktop page.
+        entry["error"] = entry_rpd_error
     job_intake_registry.append_entry(entry)
     return entry
 

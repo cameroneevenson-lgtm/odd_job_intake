@@ -1073,6 +1073,25 @@ class JobIntakePage(QWidget):
             return
         try:
             paths = job_intake_service.resolve_job_paths(entry["job_number"], entry.get("label"))
+        except JobIntakeError as exc:
+            QMessageBox.warning(self, "Create Blank RPD", str(exc))
+            return
+
+        # Intake makes the RPD automatically now, so pressing this usually
+        # means "the automatic one didn't happen". An RPD that already exists
+        # is the normal case and not worth an error dialog - just adopt it.
+        if paths.rpd_path.exists():
+            job_intake_registry.update_entry(
+                str(entry["key"]),
+                status=STATUS_RPD_CREATED,
+                rpd_path=str(paths.rpd_path),
+                error=None,
+            )
+            self.activity_label.setText(f"RPD already exists: {paths.rpd_path}")
+            self.refresh()
+            return
+
+        try:
             rpd_path = job_intake_service.clone_rpd_template(paths)
         except JobIntakeError as exc:
             QMessageBox.warning(self, "Create Blank RPD", str(exc))

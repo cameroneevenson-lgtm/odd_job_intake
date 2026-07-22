@@ -90,7 +90,10 @@ def test_submit_creates_folder_and_registry_entry_with_outlook_source(client) ->
     assert len(entries) == 1
     entry = entries[0]
     assert entry["source"] == "outlook"
-    assert entry["status"] == job_intake_registry.STATUS_NEW
+    # The blank project is made during intake, so a filed job is already past
+    # "new" - every one-off needs an RPD and nothing is gained by waiting.
+    assert entry["status"] == job_intake_registry.STATUS_RPD_CREATED
+    assert entry["rpd_path"]
     assert entry["email_sender"] == "buyer@example.com"
     assert entry["email_subject"] == "Laser order"
     # One seeded part row per DXF, awaiting manual material/thickness.
@@ -120,15 +123,24 @@ def test_submit_creates_folder_and_registry_entry_with_outlook_source(client) ->
     ]
 
 
-def test_submit_does_not_create_an_rpd_or_touch_radan(client) -> None:
-    """RADAN work stays a desktop action - the listener must only stage files."""
+def test_submit_creates_the_rpd_but_runs_no_radan_automation(client) -> None:
+    """The line is RADAN *automation*, not RADAN files.
+
+    Cloning the blank project is text substitution on a template - fast, local,
+    and every one-off job needs one - so intake does it. What must never happen
+    here is the slow interactive part: the COM conversion that turns DXFs into
+    an RPD's parts, which would block the listener's thread and hang whatever
+    called it. That stays a desktop action.
+    """
     response = client.post("/api/job-intake", json=_payload(), headers=AUTH)
     assert response.status_code == 201
 
     job_folder = Path(response.get_json()["job_folder"])
-    assert not list(job_folder.rglob("*.rpd"))
-    assert not list(job_folder.rglob("*.csv"))
-    assert response.get_json()["status"] == job_intake_registry.STATUS_NEW
+    assert list(job_folder.rglob("*.rpd")), "every one-off job gets a blank project"
+    # No import CSV and no import log: nothing was handed to RADAN.
+    assert not list(job_folder.rglob("*BOM_Radan.csv"))
+    assert not list(job_folder.rglob("*.log"))
+    assert response.get_json()["status"] == job_intake_registry.STATUS_RPD_CREATED
 
 
 def test_label_nests_the_job_under_its_own_subfolder(client, tmp_path: Path) -> None:
