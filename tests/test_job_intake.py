@@ -697,6 +697,85 @@ def _entry_with_parts(tmp_path: Path) -> dict:
     return entry
 
 
+def _print_pdf(path: Path, lines: list[tuple[float, float, str]]) -> Path:
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    page = doc.new_page()
+    for x, y, text in lines:
+        page.insert_text((x, y), text)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def test_a_print_named_by_the_customer_still_matches_its_part(
+    tmp_path, monkeypatch, shop_csvs
+) -> None:
+    """Prints are routinely named and numbered by the customer's own system
+    rather than after the part file. The part number still appears somewhere on
+    the sheet, so matching only on the title block's drawing-number cell would
+    reject the whole drawing."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    monkeypatch.setattr(
+        job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
+    )
+    dxf = _dxf_with_text(tmp_path / "F57524-C-2.dxf", "GEOMETRY ONLY")
+    pdf = _print_pdf(
+        tmp_path / "DOC-99871-B.pdf",
+        [
+            (72, 100, "CUSTOMER DRAWING SET  DOC-99871-B"),
+            (72, 130, "ITEM REF: F57524-C-2"),
+            (72, 300, "MATERIAL"),
+            (72, 310, "Mild Steel 44W"),
+        ],
+    )
+
+    entry = job_intake_service.create_intake("M90301", None, [dxf, pdf])
+    assert entry["material_qty"][0]["material"] == "Mild Steel-A36"
+
+
+def test_a_po_and_a_print_disagreeing_on_material_is_a_hard_stop(
+    tmp_path, monkeypatch, shop_csvs
+) -> None:
+    """The real case: a PO asking for aluminium against a print drawn in steel.
+    The PO's wording never *chooses* the material - customers spell it
+    inconsistently - but it absolutely gets a say in whether sources agree."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    monkeypatch.setattr(
+        job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
+    )
+    dxf = _dxf_with_text(tmp_path / "F57524-C-2.dxf", "GEOMETRY ONLY")
+    print_pdf = _print_pdf(
+        tmp_path / "DOC-99871-B.pdf",
+        [
+            (72, 130, "ITEM REF: F57524-C-2"),
+            (72, 300, "MATERIAL"),
+            (72, 310, "Mild Steel 44W"),
+        ],
+    )
+    po_pdf = _print_pdf(
+        tmp_path / "PFF PO-8497-005.pdf",
+        [
+            (72, 80, "LASER ORDER"),
+            (72, 100, "PO Number: 8497-005"),
+            (72, 140, "1"),
+            (72, 154, "2"),
+            (72, 168, 'F57524-C-2 - 1/4" Aluminum 5052'),
+        ],
+    )
+
+    entry = job_intake_service.create_intake("M90302", None, [dxf, print_pdf, po_pdf])
+    part = entry["material_qty"][0]
+
+    conflict = part["source_conflict"]
+    assert "the PO says Aluminum 5052" in conflict
+    assert "the print says Mild Steel-A36" in conflict
+
+    with pytest.raises(JobIntakeError) as excinfo:
+        job_intake_service.build_import_csv_rows(entry)
+    assert "STOP" in str(excinfo.value)
+
+
 def test_conflicting_sources_are_a_hard_stop(tmp_path: Path) -> None:
     """Two sources giving different answers isn't a note to read past. Whoever
     asked for the job has to say which is right - ranking one source over the

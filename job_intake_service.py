@@ -451,9 +451,17 @@ def create_intake(
         # print was superseded by the BOM, or the email is about a different
         # job - and is far more useful surfaced than silently resolved by
         # whichever source happened to rank higher.
+        # The PO's own wording for this line. It is not used to *choose* a
+        # material - customer POs spell it inconsistently, which is why that
+        # has always been reference-only - but it absolutely gets a say in
+        # whether the sources agree. A PO asking for aluminium against a print
+        # drawn in steel is the exact disagreement worth stopping for.
+        po_material = _match_material_in_text(str(hint.get("raw_description", "") or ""))
+
         stated = {
             "the CAM BOM": cam_row["material"] if cam_row else None,
             "the BOM": bom_material,
+            "the PO": po_material,
             "the email": email_hints.material,
             "the print": print_hints.material,
             "the drawing": dxf_hints.material,
@@ -1584,6 +1592,26 @@ _ALL_LABEL_WORDS = frozenset(
 )
 
 
+def _page_names_part(words: list[tuple], cells: dict[str, str], wanted: str) -> bool:
+    """Whether this page is about `wanted` (already normalised).
+
+    Prefers the title block's drawing-number cell, but falls back to the part
+    number appearing anywhere on the page. Prints are routinely named and
+    numbered by the customer's own system rather than after the part file, and
+    in that case the part number still shows up somewhere on the sheet - so
+    refusing to look outside the title block would reject the whole drawing.
+    """
+    if not wanted:
+        return True
+
+    stated = _normalize_match_key(cells.get("part", ""))
+    if stated and (wanted in stated or stated in wanted):
+        return True
+
+    anywhere = _normalize_match_key(" ".join(str(word[4]) for word in words))
+    return wanted in anywhere
+
+
 def _print_words(pdf_path: Path) -> list[list[tuple]]:
     """Per page, the word boxes (x0, y0, x1, y1, text)."""
     try:
@@ -1692,12 +1720,8 @@ def extract_print_hints(pdf_path: Path, part_stem: str | None = None) -> PrintHi
         if not cells:
             continue
 
-        if wanted:
-            stated = _normalize_match_key(cells.get("part", ""))
-            # Accept a containment match: the cell often carries a revision or
-            # sheet suffix the DXF's name doesn't.
-            if not stated or (wanted not in stated and stated not in wanted):
-                continue
+        if not _page_names_part(words, cells, wanted):
+            continue
 
         if material is None and cells.get("material"):
             material_text = cells["material"]
