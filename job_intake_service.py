@@ -883,10 +883,11 @@ DESCRIPTION_RULES_FILENAME = "description_rules.csv"
 # same class of bug the registry invariant warns about. The file is re-read on
 # every call so materials the shop adds appear without restarting anything.
 #
-# expected_laser_descriptions.csv is deliberately not read here at all.
-# inventor_to_radan still uses it for its own missing-DXF classification, but
-# intake does not: it listed a far narrower set than the rules table and gating
-# on it rejected materials that turn up in real customer BOMs.
+# expected_laser_descriptions.csv is not read: it listed a far narrower set
+# than the rules table and gating on it rejected materials that turn up in real
+# customer BOMs. inventor_to_radan has since deleted that file outright, so
+# column A of description_rules.csv is the single list of known laser
+# descriptions on both sides.
 def _description_rules_path() -> Path:
     return INVENTOR_TO_RADAN_DIR / DESCRIPTION_RULES_FILENAME
 

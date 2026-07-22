@@ -96,11 +96,12 @@ tells the user to add a Label — that guard is deliberate.
 Its **Material / Thickness / Strategy** columns are the authority for what
 exists. Everything else here is a *route into* them, never a source of truth:
 
-- **`expected_laser_descriptions.csv` is deliberately not read.** It lists a
-  far narrower set (14 rows against 36) and gating on it rejected materials
-  that turn up in real customer BOMs — 3003 checker plate came through a
-  parts list and was refused. `inventor_to_radan` still uses that file for its
-  own missing-DXF classification; intake does not.
+- **`expected_laser_descriptions.csv` no longer exists.** It listed a far
+  narrower set than the rules table and gating on it rejected materials that
+  turn up in real customer BOMs — 3003 checker plate came through a parts list
+  and was refused. `inventor_to_radan` has since deleted the file outright;
+  column A of `description_rules.csv` is now the single list of known laser
+  descriptions on both sides.
 - **The Description column is not read either** when building the material
   list. It is a lookup key whose wording varies per customer, and tokenising
   it harvested "new", "tool" and "mm" as if they named materials. Material
