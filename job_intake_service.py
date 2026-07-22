@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import date, datetime
+import json
 from pathlib import Path
 import re
 import shutil
@@ -425,7 +426,39 @@ def thickness_choices(material: str) -> tuple[float, ...]:
     return material_thickness_catalog().get(str(material or "").strip(), ())
 
 
+def _strategies_from_rules() -> dict[str, str]:
+    """material -> strategy, as recorded in inventor_to_radan's rules table.
+
+    That file is the truth for what the CAM side expects, so it decides which
+    strategy a material gets rather than anything hardcoded here.
+    """
+    counts: dict[str, dict[str, int]] = {}
+    for rule in _read_description_rules().values():
+        material = str(rule.get("material", "") or "").strip()
+        strategy = str(rule.get("strategy", "") or "").strip()
+        if material and strategy:
+            counts.setdefault(material, {})
+            counts[material][strategy] = counts[material].get(strategy, 0) + 1
+
+    resolved: dict[str, str] = {}
+    for material, spellings in counts.items():
+        winner = max(spellings.items(), key=lambda pair: pair[1])[0]
+        # The file spells the same strategy inconsistently (AIR vs Air). Where
+        # our known-good constant matches case-insensitively, keep its casing:
+        # the truth decides *which* strategy, not how to capitalise it, and
+        # this casing is what the RADAN import was verified against.
+        known = MATERIAL_DEFAULT_STRATEGY.get(material)
+        if known and known.casefold() == winner.casefold():
+            winner = known
+        resolved[material] = winner
+    return resolved
+
+
 def default_strategy_for_material(material: str) -> str:
+    material = str(material or "").strip()
+    from_truth = _strategies_from_rules().get(material)
+    if from_truth:
+        return from_truth
     exact = MATERIAL_DEFAULT_STRATEGY.get(material)
     if exact:
         return exact
@@ -607,7 +640,11 @@ _DXF_QTY_SUFFIX_PATTERN = re.compile(
     r"\b(\d{1,4})\s*(?:OFF|PLCS?|PCS?|REQ'?D)\b", re.IGNORECASE
 )
 _DXF_THICKNESS_PATTERN = re.compile(
-    r"(\d+(?:\.\d+)?|\d+\s*/\s*\d+)\s*(?:\"|IN\b|INCH)?\s*(?:THK|THICK)", re.IGNORECASE
+    # Leading-dot decimals first: drawings write ".125 THK" far more often than
+    # "0.125 THK", and without this alternative the dot was skipped and the
+    # value read as 125 inches.
+    r"(\d+\s*/\s*\d+|\d*\.\d+|\d+)\s*(?:\"|IN\b|INCH)?\s*(?:THK|THICK)",
+    re.IGNORECASE,
 )
 
 
@@ -732,6 +769,234 @@ def _material_tokens() -> dict[str, str]:
     }
 
 
+# --- material fingerprinting -------------------------------------------------
+#
+# A deliberately lossy hash of a material phrase. Unlike a normal hash,
+# collisions are the entire point: every way a drawing can write the same
+# material must land in the same bucket, so that one verified answer covers all
+# of them. "MATL: ALUMINIUM 5052", "AL ALY 5052-H32" and "5052 alum plate" are
+# meant to collide.
+#
+# It works by throwing away everything that isn't material-defining - noise
+# words, dimensions, tempers, punctuation, word order - and mapping what
+# survives onto equivalence classes. The fingerprint is then the sorted set of
+# classes, so ordering can't create two buckets for one material.
+
+# Words that appear on drawings regardless of material.
+_FINGERPRINT_NOISE = frozenset({
+    "material", "matl", "mat", "mtl", "made", "from", "of", "grade", "spec",
+    "plate", "sheet", "bar", "tube", "flat", "stock", "thk", "thick", "thickness",
+    "ga", "gauge", "gage", "typ", "all", "parts", "part", "note", "notes", "see",
+    "req", "reqd", "required", "qty", "quantity", "off", "pcs", "pc", "plcs",
+    "finish", "mill", "raw", "general", "min", "max", "nom", "ref", "approx",
+})
+
+# Tempers and heat treatments: they qualify a material without changing which
+# one it is, so they must not split the bucket.
+_FINGERPRINT_TEMPERS = re.compile(r"^(?:h\d{2,3}|t\d{1,2}|o|f|hr|cr|ann|annealed)$")
+
+# Equivalence classes. Everything on the right collapses to the key, which is
+# what makes the collisions happen on purpose.
+_FINGERPRINT_CLASSES: dict[str, frozenset[str]] = {
+    "ALU": frozenset({
+        "al", "alu", "alum", "alumin", "aluminum", "aluminium", "aly", "alloy",
+    }),
+    "STEEL": frozenset({"steel", "stl", "st"}),
+    "MILD": frozenset({"mild", "ms", "crs", "hrs", "coldrolled", "hotrolled", "carbon"}),
+    "STAINLESS": frozenset({"ss", "sst", "stainless", "inox"}),
+    "GALV": frozenset({"galv", "galvanised", "galvanized", "gi"}),
+    "CHK": frozenset({"chk", "checker", "checkered", "chequer", "chequered", "tread"}),
+}
+
+_FINGERPRINT_TOKEN_TO_CLASS = {
+    token: klass for klass, tokens in _FINGERPRINT_CLASSES.items() for token in tokens
+}
+
+
+# Multi-word forms, collapsed before tokenising so both halves survive as one.
+_FINGERPRINT_PHRASES = (
+    (re.compile(r"\bcold\s*roll(?:ed)?\b"), "crs"),
+    (re.compile(r"\bhot\s*roll(?:ed)?\b"), "hrs"),
+    (re.compile(r"\bstainless\s*steel\b"), "stainless"),
+    (re.compile(r"\bmild\s*steel\b"), "mild"),
+    (re.compile(r"\bcarbon\s*steel\b"), "mild"),
+    (re.compile(r"\bcheck(?:er|ered|quer|quered)\s*plate\b"), "chk"),
+    (re.compile(r"\bal\s*aly\b"), "aluminum"),
+)
+
+# A grade designation: 3-4 digit alloy (5052, 304), or a letter/number pair
+# (A36, 44W). Anything not matching this and not in a class is dropped.
+_FINGERPRINT_GRADE = re.compile(r"^(?:\d{3,4}|[a-z]\d{2,3}|\d{2,3}[a-z])$")
+
+
+def material_fingerprint(text: str) -> str:
+    """A collision-seeking fingerprint of a material phrase.
+
+    Unlike a normal hash, collisions are the whole point: every way a drawing
+    can write the same material must land in the same bucket. Returns "" when
+    nothing material-defining survives, which is the signal that the text said
+    nothing useful rather than that it hashed to empty.
+
+    Everything not recognisably a material class or a grade is discarded. That
+    strictness is deliberate - keeping unknown words by default let noise like
+    "astm", "csa" and "is" split buckets that should have collided.
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return ""
+
+    working = raw.casefold()
+    # Dimensions and thicknesses first: ".125", "0.250", "1/4" would otherwise
+    # survive as grade-shaped digits and split identical materials apart.
+    working = re.sub(r"\d*\.\d+", " ", working)
+    working = re.sub(r"\d+\s*/\s*\d+", " ", working)
+    # "80 X 120" is a size, not a grade - strip it before the letter/number
+    # recombination below turns "X 120" into a grade-shaped "x120".
+    working = re.sub(r"\d+\s*x\s*\d+", " ", working)
+    # Punctuation to space, so "M.S." and "A-36" survive as tokens at all.
+    working = re.sub(r"[^a-z0-9]+", " ", working)
+    # "M S" -> "ms": single letters run together are an abbreviation, not words.
+    working = re.sub(r"\b([a-z])\s+([a-z])\b(?!\s*[a-z])", r"\1\2", working)
+    # "A 36" / "44 W" -> "a36" / "44w" before the grade test sees them.
+    working = re.sub(r"\b([a-z])\s+(\d{2,3})\b", r"\1\2", working)
+    working = re.sub(r"\b(\d{2,3})\s+([a-z])\b", r"\1\2", working)
+
+    for pattern, replacement in _FINGERPRINT_PHRASES:
+        working = pattern.sub(f" {replacement} ", working)
+
+    parts: set[str] = set()
+    for token in working.split():
+        if token in _FINGERPRINT_NOISE or _FINGERPRINT_TEMPERS.match(token):
+            continue
+        klass = _FINGERPRINT_TOKEN_TO_CLASS.get(token)
+        if klass is not None:
+            parts.add(klass)
+        elif _FINGERPRINT_GRADE.match(token):
+            parts.add(token)
+        # Everything else is discarded on purpose.
+
+    # STEEL is a generic qualifier. It only stands alone when nothing more
+    # specific was found, so that "MILD STEEL"/"MS" collide, and so that
+    # "ASTM A36 STEEL" collides with a bare "A36".
+    grades = {part for part in parts if _FINGERPRINT_GRADE.match(part)}
+    if grades or parts & {"MILD", "STAINLESS", "GALV"}:
+        parts.discard("STEEL")
+
+    if not parts:
+        return ""
+    return "+".join(sorted(parts))
+
+
+MATERIAL_MEMORY_FILENAME = "material_fingerprints.json"
+MATERIAL_MEMORY_PATH = APP_DIR / "_runtime" / MATERIAL_MEMORY_FILENAME
+
+
+def _material_memory_path() -> Path:
+    # Read the module global at call time so tests can monkeypatch it - the
+    # same reason the registry resolves its path this way. Binding it as a
+    # default argument or capturing it at import let a test write learned
+    # material wordings into the real _runtime store.
+    return MATERIAL_MEMORY_PATH
+
+
+def _load_material_memory() -> dict[str, dict[str, Any]]:
+    """fingerprint -> {material: times_verified, ...}."""
+    try:
+        payload = json.loads(_material_memory_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    return entries if isinstance(entries, dict) else {}
+
+
+def learn_material_fingerprint(source_text: str, material: str) -> str:
+    """Record that a human confirmed `source_text` means `material`.
+
+    This is the payoff of making the user verify: their correction is the
+    training signal. Next time any drawing writes the material the same way -
+    or any of the countless other ways that collide onto the same fingerprint -
+    it is predicted from experience rather than from the hand-seeded aliases.
+
+    Returns the fingerprint learned, or "" if the text carried nothing.
+    """
+    fingerprint = material_fingerprint(source_text)
+    material = str(material or "").strip()
+    if not fingerprint or not material:
+        return ""
+
+    entries = _load_material_memory()
+    bucket = entries.setdefault(fingerprint, {})
+    if not isinstance(bucket, dict):
+        bucket = {}
+    bucket[material] = int(bucket.get(material, 0)) + 1
+    entries[fingerprint] = bucket
+
+    path = _material_memory_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(".json.tmp")
+    temp_path.write_text(
+        json.dumps({"version": 1, "entries": entries}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temp_path.replace(path)
+    return fingerprint
+
+
+def recall_material(source_text: str) -> str | None:
+    """The material previously verified for this text's fingerprint.
+
+    Returns None when the bucket has never been seen, or when past
+    verifications disagree - a fingerprint that has been confirmed as two
+    different materials is a collision that shouldn't have happened, and
+    guessing between them is worse than asking.
+    """
+    fingerprint = material_fingerprint(source_text)
+    if not fingerprint:
+        return None
+    bucket = _load_material_memory().get(fingerprint)
+    if not isinstance(bucket, dict) or not bucket:
+        return None
+    materials = [name for name, count in bucket.items() if int(count or 0) > 0]
+    if len(materials) != 1:
+        return None
+    material = materials[0]
+    return material if material in set(material_choices()) else None
+
+
+def material_memory_conflicts() -> dict[str, dict[str, int]]:
+    """Fingerprints verified as more than one material.
+
+    A real collision between materials that aren't the same thing - either the
+    fingerprint is too lossy, or somebody verified a row wrongly. Surfaced so
+    it can be looked at rather than silently degrading predictions.
+    """
+    return {
+        fingerprint: bucket
+        for fingerprint, bucket in _load_material_memory().items()
+        if isinstance(bucket, dict)
+        and len([name for name, count in bucket.items() if int(count or 0) > 0]) > 1
+    }
+
+
+def _material_grades() -> dict[str, set[str]]:
+    """material -> the grade numbers that legitimately belong to it.
+
+    Used to stop a generic word claiming a specific alloy: "ALUM" alone maps
+    to the shop's aluminium, but "6061 ALUM" names an alloy that isn't it.
+    Derived from the same two sources as everything else, so it widens as the
+    shop's files do.
+    """
+    grades: dict[str, set[str]] = {}
+    for token, material in _material_tokens().items():
+        if token[0].isdigit() and _FINGERPRINT_GRADE.match(token):
+            grades.setdefault(material, set()).add(token)
+    for alias, material in _read_material_aliases().items():
+        for part in material_fingerprint(alias).split("+"):
+            if part and part[0].isdigit() and _FINGERPRINT_GRADE.match(part):
+                grades.setdefault(material, set()).add(part)
+    return grades
+
+
 def _match_material_in_text(text: str) -> str | None:
     """Canonical material for this text, only when exactly one matches.
 
@@ -746,6 +1011,13 @@ def _match_material_in_text(text: str) -> str | None:
     raw = str(text or "")
     if not raw.strip():
         return None
+
+    # What a human already confirmed for this fingerprint beats both the
+    # hand-seeded aliases and the derived tokens: it is evidence from this
+    # shop's own drawings rather than a guess about how they might be worded.
+    remembered = recall_material(raw)
+    if remembered is not None:
+        return remembered
 
     available = set(material_choices())
     matches: set[str] = set()
@@ -762,8 +1034,75 @@ def _match_material_in_text(text: str) -> str | None:
         if token in words and material in available:
             matches.add(material)
 
-    if len(matches) == 1:
-        return matches.pop()
+    if len(matches) != 1:
+        return None
+    material = matches.pop()
+
+    # A generic word ("ALUM") must not claim a specific alloy the drawing did
+    # not ask for. If the text names a grade that isn't one of this material's
+    # known grades, it is a different alloy - 6061-T6 ALUM is not Aluminum
+    # 5052 - so predict nothing and let the user decide.
+    known = _material_grades().get(material, set())
+    stated = {
+        part
+        for part in material_fingerprint(raw).split("+")
+        if part and part[0].isdigit() and _FINGERPRINT_GRADE.match(part)
+    }
+    if stated and known and not (stated & known):
+        return None
+    return material
+
+
+# Sheet gauges. A gauge number is not a thickness - it means different things
+# per material family, so a gauge can only be converted once the material is
+# known. Manufacturers' Standard Gauge for steel, Brown & Sharpe for aluminium.
+#
+# Worked example of why nothing here is trusted directly: 11ga steel is .118
+# nominal, the CAM side wants .12, and the shop floor calls it "1/8" or ".125".
+# Four numbers for one sheet. That is exactly why every value below is passed
+# through snap_thickness() onto whatever the catalog actually lists, instead of
+# being used as a thickness in its own right - "11 GA", "1/8" and ".125" all
+# have to end up at the same catalog entry.
+_STEEL_GAUGES = {
+    7: 0.1793, 8: 0.1644, 9: 0.1495, 10: 0.1345, 11: 0.118, 12: 0.1046,
+    13: 0.0897, 14: 0.0747, 15: 0.0673, 16: 0.0598, 17: 0.0538, 18: 0.0478,
+    19: 0.0418, 20: 0.0359, 21: 0.0329, 22: 0.0299, 24: 0.0239, 26: 0.0179,
+}
+_ALUMINUM_GAUGES = {
+    7: 0.1443, 8: 0.1285, 9: 0.1144, 10: 0.1019, 11: 0.09, 12: 0.0808,
+    13: 0.0720, 14: 0.0641, 15: 0.0571, 16: 0.0508, 17: 0.0453, 18: 0.0403,
+    19: 0.0359, 20: 0.0320, 21: 0.0285, 22: 0.0253, 24: 0.0201, 26: 0.0159,
+}
+
+_GAUGE_PATTERN = re.compile(r"\b(\d{1,2})\s*(?:GA|GAGE|GAUGE)\b", re.IGNORECASE)
+
+# The shop rounds thicknesses to 2dp in places (1/8 -> 0.12, 3/8 -> 0.38) but
+# keeps full precision in others (0.375). Rather than pick one convention,
+# snap a measured value onto whatever the catalog actually offers. 5% is wide
+# enough for .125->.12 and .1875->.18, far too tight to confuse .12 with .18.
+_THICKNESS_SNAP_TOLERANCE = 0.05
+
+
+def _gauge_to_inches(gauge: int, material: str) -> float | None:
+    table = _ALUMINUM_GAUGES if "alum" in material.casefold() else _STEEL_GAUGES
+    return table.get(int(gauge))
+
+
+def snap_thickness(value: float | None, material: str) -> float | None:
+    """Snap a measured thickness onto the nearest one the shop stocks.
+
+    A drawing says .125 where the catalog says 0.12, or .1875 where it says
+    0.18; those are the same sheet. Returns None when nothing is close enough,
+    which correctly rejects a thickness this material isn't available in.
+    """
+    if value is None or value <= 0:
+        return None
+    available = thickness_choices(material)
+    if not available:
+        return None
+    nearest = min(available, key=lambda option: abs(option - value))
+    if abs(nearest - value) <= _THICKNESS_SNAP_TOLERANCE * max(value, nearest):
+        return nearest
     return None
 
 
@@ -822,17 +1161,26 @@ def extract_dxf_hints(dxf_path: Path) -> DXFHints:
                 qty = candidate
                 break
 
+    # Thickness only means something once the material is known: the catalog
+    # differs per material, and a gauge number is meaningless without it.
     thickness: float | None = None
-    thickness_match = _DXF_THICKNESS_PATTERN.search(joined)
-    if thickness_match is not None:
-        thickness = _parse_fraction_or_number(thickness_match.group(1))
-    # Only keep a thickness the shop actually stocks for that material -
-    # otherwise it would fail RADAN's import later anyway.
-    if thickness is not None and material is not None:
-        if thickness not in thickness_choices(material):
-            thickness = None
-    elif thickness is not None and material is None:
-        thickness = None
+    if material is not None:
+        measured: float | None = None
+        thickness_match = _DXF_THICKNESS_PATTERN.search(joined)
+        if thickness_match is not None:
+            measured = _parse_fraction_or_number(thickness_match.group(1))
+
+        if measured is None:
+            gauge_match = _GAUGE_PATTERN.search(joined)
+            if gauge_match is not None:
+                try:
+                    measured = _gauge_to_inches(int(gauge_match.group(1)), material)
+                except ValueError:
+                    measured = None
+
+        # Snapping is what turns the drawing's .125 into the catalog's 0.12,
+        # and it rejects anything not close to a stocked thickness.
+        thickness = snap_thickness(measured, material)
 
     contributing = tuple(
         value for value in values

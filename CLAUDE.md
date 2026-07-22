@@ -88,6 +88,36 @@ Job number already exists (real truck, or a prior one-off) -> Label required:
 `create_job_folders` refuses a fresh intake when the folder already exists and
 tells the user to add a Label — that guard is deliberate.
 
+## `inventor_to_radan`'s CSVs are the truth
+
+`expected_laser_descriptions.csv` (what exists) and `description_rules.csv`
+(what each description means: material, thickness, strategy) are **the**
+authority. Everything else here is a *route into* them, never a source of
+truth:
+
+- **Nothing may reach the import CSV that didn't come from those files.**
+  `snap_thickness()` only ever returns a value listed in the catalog;
+  material matching only returns a member of `material_choices()`;
+  `default_strategy_for_material()` reads the rules table. Adding a new way to
+  guess is fine — letting a guess through unvalidated is not.
+- **Both are re-read on every call**, never cached at import, and their paths
+  resolve at call time. The shop edits them and new materials must appear
+  without a restart. Binding them as module constants also silently defeats
+  monkeypatching — the same trap as the registry path.
+- `material_aliases.csv` (customer wording) and the gauge tables are
+  *translation layers only*. An alias pointing at a material the catalog
+  doesn't list is ignored.
+- **Thickness is snapped, not rounded.** A drawing's `.125` must become the
+  catalog's `0.12`, but blanket 2dp rounding would also turn `.375` into
+  `0.38` and miss mild steel's actual `0.375` entry. Real example of why:
+  11ga steel is `.118` nominal, CAM wants `.12`, and the floor calls it `1/8`
+  or `.125` — four numbers, one sheet, and the catalog decides which wins.
+- **A gauge is meaningless without a material** (16ga steel `.0598"`, 16ga
+  aluminium `.0508"`), so gauges are only converted after a material matches.
+- Strategy casing in the rules file is inconsistent (`AIR` vs `Air`). The file
+  decides *which* strategy; `MATERIAL_DEFAULT_STRATEGY` keeps the casing that
+  the RADAN import was actually verified against.
+
 ## Data-entry rules
 
 - **Material stays manual.** Customer POs spell it inconsistently

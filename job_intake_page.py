@@ -735,7 +735,23 @@ class JobIntakePage(QWidget):
         fields = self._collect_detail_fields()
         updated = job_intake_registry.update_entry(str(entry["key"]), **fields)
         entry.update(updated)
-        self.activity_label.setText("Details saved.")
+
+        # A confirmed row is a human saying "this drawing's wording means this
+        # material" - the signal that lets the next job be predicted from
+        # experience instead of from hand-seeded aliases.
+        learned = 0
+        for part in fields.get("material_qty", []):
+            if not part.get("material_confirmed"):
+                continue
+            source = str(part.get("material_source_text", "") or "").strip()
+            material = str(part.get("material", "") or "").strip()
+            if source and material and job_intake_service.learn_material_fingerprint(source, material):
+                learned += 1
+
+        message = "Details saved."
+        if learned:
+            message += f" Learned {learned} material wording{'s' if learned != 1 else ''}."
+        self.activity_label.setText(message)
         return updated
 
     def _create_rpd(self) -> None:

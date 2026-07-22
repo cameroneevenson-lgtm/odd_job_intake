@@ -50,6 +50,10 @@ def isolated_roots(tmp_path: Path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setattr(job_intake_service, "EXPLORER_TEMPLATE_PATH", template_path)
+    # Learned material wordings must never land in the real _runtime store.
+    monkeypatch.setattr(
+        job_intake_service, "MATERIAL_MEMORY_PATH", tmp_path / "material_fingerprints.json"
+    )
     return tmp_path
 
 

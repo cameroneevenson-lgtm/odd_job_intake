@@ -257,6 +257,240 @@ def test_catalog_picks_up_materials_added_after_launch(tmp_path: Path, monkeypat
     assert job_intake_service.thickness_choices("Stainless Steel") == (0.25,)
 
 
+@pytest.fixture()
+def material_memory(tmp_path: Path, monkeypatch) -> Path:
+    """Isolate the learned-wording store; it must never touch real _runtime."""
+    path = tmp_path / "material_fingerprints.json"
+    monkeypatch.setattr(job_intake_service, "MATERIAL_MEMORY_PATH", path)
+    return path
+
+
+# --- material fingerprinting -------------------------------------------------
+# A hash that is *supposed* to collide: every way of writing one material has
+# to land in the same bucket, or the learned mapping is useless.
+
+
+@pytest.mark.parametrize(
+    "variants",
+    [
+        pytest.param(
+            [
+                "MATL: ALUMINIUM 5052",
+                "AL ALY 5052-H32",
+                "5052 alum plate",
+                "aluminum 5052",
+                '1/4 THK AL 5052',
+                'SHEET, AL ALY, .125" THK, 5052 H32',
+            ],
+            id="aluminium-5052",
+        ),
+        pytest.param(
+            ["MILD STEEL", "MS", "M.S.", "CRS", "cold rolled steel", "CARBON STEEL", "hot rolled"],
+            id="mild-steel",
+        ),
+        pytest.param(["A36", "A-36", "ASTM A36 STEEL", "MATL: A 36"], id="a36"),
+        pytest.param(["44W", "44 W", "CSA 44W PLATE", "MATERIAL: 44W"], id="44w"),
+        pytest.param(["SS 304", "304 STAINLESS STEEL", "stainless 304"], id="stainless-304"),
+    ],
+)
+def test_every_spelling_of_one_material_collides(variants) -> None:
+    fingerprints = {job_intake_service.material_fingerprint(text) for text in variants}
+    assert len(fingerprints) == 1, f"should have collided, got {fingerprints}"
+    assert fingerprints != {""}
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["SEE NOTE 3", "PART IS 80 X 120", "QTY: 4", '1/4" THK', "GUSSET PLATE", "80 X 120 X 6", ""],
+    ids=["note", "dimensions", "qty", "thickness", "part-name", "three-dims", "empty"],
+)
+def test_text_with_no_material_fingerprints_to_nothing(text) -> None:
+    """An empty fingerprint means "said nothing useful", which must not be
+    confused with a real bucket - otherwise every unrelated note would collide
+    into one and be learned as a material."""
+    assert job_intake_service.material_fingerprint(text) == ""
+
+
+def test_different_materials_do_not_collide() -> None:
+    distinct = [
+        "ALUMINUM 5052",
+        "MILD STEEL",
+        "STAINLESS 304",
+        "3003 CHECKER PLATE",
+    ]
+    fingerprints = [job_intake_service.material_fingerprint(text) for text in distinct]
+    assert len(set(fingerprints)) == len(distinct), fingerprints
+
+
+def test_thickness_and_size_never_reach_the_fingerprint() -> None:
+    """The same material at different thicknesses is still the same material."""
+    quarter = job_intake_service.material_fingerprint('1/4" THK ALUMINUM 5052')
+    half = job_intake_service.material_fingerprint('.500 THK ALUMINUM 5052')
+    sized = job_intake_service.material_fingerprint("ALUMINUM 5052 80 X 120")
+    assert quarter == half == sized
+
+
+# --- learning from verifications ---------------------------------------------
+
+
+def test_a_verified_wording_is_recalled_for_every_colliding_spelling(
+    material_memory, shop_csvs
+) -> None:
+    """The point of making the user verify: their confirmation teaches the
+    bucket, so all the other spellings of it are predicted next time."""
+    assert job_intake_service.recall_material("MATL: ALUMINIUM 5052") is None
+
+    job_intake_service.learn_material_fingerprint("MATL: ALUMINIUM 5052", "Aluminum 5052")
+
+    assert job_intake_service.recall_material("MATL: ALUMINIUM 5052") == "Aluminum 5052"
+    # A wording never seen before, but which collides onto the same bucket.
+    assert job_intake_service.recall_material("5052 alum plate") == "Aluminum 5052"
+    assert job_intake_service.recall_material('AL ALY 5052 H32') == "Aluminum 5052"
+
+
+def test_learning_beats_the_hand_seeded_aliases(material_memory, shop_csvs) -> None:
+    """Evidence from this shop's own drawings outranks a guess about wording."""
+    # "CRS" is aliased to Mild Steel-A36 out of the box.
+    assert job_intake_service._match_material_in_text("MATL: CRS") == "Mild Steel-A36"
+
+    job_intake_service.learn_material_fingerprint("MATL: CRS", "Aluminum 5052")
+
+    assert job_intake_service._match_material_in_text("MATL: CRS") == "Aluminum 5052"
+
+
+def test_a_conflicting_bucket_predicts_nothing_and_is_reported(
+    material_memory, shop_csvs
+) -> None:
+    """Two different materials verified onto one fingerprint is a collision
+    that shouldn't have happened - guessing between them is worse than asking."""
+    job_intake_service.learn_material_fingerprint("MATL: MS", "Mild Steel-A36")
+    job_intake_service.learn_material_fingerprint("MATL: MS", "Aluminum 5052")
+
+    assert job_intake_service.recall_material("MATL: MS") is None
+
+    conflicts = job_intake_service.material_memory_conflicts()
+    assert len(conflicts) == 1
+    bucket = next(iter(conflicts.values()))
+    assert set(bucket) == {"Mild Steel-A36", "Aluminum 5052"}
+
+
+def test_learning_ignores_text_with_no_material(material_memory, shop_csvs) -> None:
+    assert job_intake_service.learn_material_fingerprint("SEE NOTE 3", "Aluminum 5052") == ""
+    assert job_intake_service.recall_material("SEE NOTE 3") is None
+
+
+def test_recall_drops_a_material_the_catalog_no_longer_lists(
+    material_memory, shop_csvs, tmp_path, monkeypatch
+) -> None:
+    """The expected-descriptions file stays authoritative even over learning."""
+    job_intake_service.learn_material_fingerprint("MATL: ALUMINIUM 5052", "Aluminum 5052")
+    assert job_intake_service.recall_material("MATL: ALUMINIUM 5052") == "Aluminum 5052"
+
+    # The shop drops aluminium from the expected list.
+    _write_shop_csvs(
+        tmp_path / "inventor_to_radan",
+        descriptions=['PLATE, MS, .375" THK, 44W'],
+        rules=[('PLATE, MS, .375" THK, 44W', "Mild Steel-A36", "0.375", "O2")],
+    )
+    assert job_intake_service.recall_material("MATL: ALUMINIUM 5052") is None
+
+
+# --- thickness snapping and gauges -------------------------------------------
+
+
+def test_drawing_decimals_snap_onto_the_catalog_value(tmp_path, monkeypatch) -> None:
+    """A drawing says .125 where the catalog says 0.12; same sheet. Blanket
+    rounding can't do this - it would also turn .375 into .38 and miss mild
+    steel's actual 0.375 entry - so snap to the nearest stocked value.
+
+    Uses its own catalog mirroring the real shop files, where aluminium is
+    recorded rounded (0.12/0.18/0.38) and mild steel exact (0.375).
+    """
+    shop = tmp_path / "inventor_to_radan"
+    _write_shop_csvs(
+        shop,
+        descriptions=[
+            'SHEET, AL ALY, .125" THK, 5052 H32',
+            'PLATE, AL ALY, .188" THK, 5052 H32',
+            'PLATE, AL ALY, .375" THK, 5052 H32',
+            'PLATE, MS, .375" THK, 44W',
+        ],
+        rules=[
+            ('SHEET, AL ALY, .125" THK, 5052 H32', "Aluminum 5052", "0.12", "Air"),
+            ('PLATE, AL ALY, .188" THK, 5052 H32', "Aluminum 5052", "0.18", "Air"),
+            ('PLATE, AL ALY, .375" THK, 5052 H32', "Aluminum 5052", "0.38", "Air"),
+            ('PLATE, MS, .375" THK, 44W', "Mild Steel-A36", "0.375", "O2"),
+        ],
+    )
+    monkeypatch.setattr(job_intake_service, "INVENTOR_TO_RADAN_DIR", shop)
+
+    assert job_intake_service.snap_thickness(0.125, "Aluminum 5052") == 0.12
+    assert job_intake_service.snap_thickness(0.1875, "Aluminum 5052") == 0.18
+
+    # The same nominal 3/8 lands on a different number per material, because
+    # the shop's own files record it differently - which is precisely why this
+    # snaps to the catalog rather than rounding.
+    assert job_intake_service.snap_thickness(0.375, "Aluminum 5052") == 0.38
+    assert job_intake_service.snap_thickness(0.375, "Mild Steel-A36") == 0.375
+    assert job_intake_service.snap_thickness(0.38, "Mild Steel-A36") == 0.375
+
+    # 11ga steel: .118 nominal, CAM wants .12, everyone calls it 1/8 or .125.
+    # All four have to converge on the one catalog entry.
+    assert job_intake_service.snap_thickness(0.118, "Aluminum 5052") == 0.12
+    assert job_intake_service.snap_thickness(0.125, "Aluminum 5052") == 0.12
+
+
+def test_a_thickness_that_is_not_stocked_snaps_to_nothing(shop_csvs) -> None:
+    assert job_intake_service.snap_thickness(1.5, "Aluminum 5052") is None
+    assert job_intake_service.snap_thickness(0.0598, "Aluminum 5052") is None
+    assert job_intake_service.snap_thickness(0.25, "Mild Steel-A36") is None
+    assert job_intake_service.snap_thickness(None, "Aluminum 5052") is None
+    assert job_intake_service.snap_thickness(0.12, "not a material") is None
+
+
+def test_a_gauge_means_different_thicknesses_per_material() -> None:
+    """16ga steel is .0598" but 16ga aluminium is .0508" - a gauge number is
+    meaningless until the material is known, which is why it is only converted
+    after a material has been matched."""
+    assert job_intake_service._gauge_to_inches(16, "Mild Steel-A36") == 0.0598
+    assert job_intake_service._gauge_to_inches(16, "Aluminum 5052") == 0.0508
+    assert job_intake_service._gauge_to_inches(7, "Mild Steel-A36") == 0.1793
+    assert job_intake_service._gauge_to_inches(99, "Aluminum 5052") is None
+
+
+def test_dxf_thickness_snaps_and_gauges_are_read(tmp_path, shop_csvs) -> None:
+    quarter = job_intake_service.extract_dxf_hints(
+        _dxf_with_text(tmp_path / "A.dxf", "5052 ALUMINUM", '.125" THK')
+    )
+    assert quarter.thickness == 0.12          # snapped, not 0.125
+
+    gauge = job_intake_service.extract_dxf_hints(
+        _dxf_with_text(tmp_path / "B.dxf", "MILD STEEL", "10 GA")
+    )
+    # 10ga steel is .1345", which this shop doesn't stock - so nothing is
+    # claimed rather than snapping to a thickness they'd have to substitute.
+    assert gauge.thickness is None
+    assert gauge.material == "Mild Steel-A36"
+
+
+def test_thickness_is_never_claimed_without_a_material(tmp_path, shop_csvs) -> None:
+    hints = job_intake_service.extract_dxf_hints(
+        _dxf_with_text(tmp_path / "C.dxf", '1/4" THK', "16 GA")
+    )
+    assert hints.material is None
+    assert hints.thickness is None
+
+
+def test_a_generic_word_cannot_claim_an_alloy_the_shop_lacks(shop_csvs) -> None:
+    """Regression: "ALUM" is aliased to the shop's aluminium, so
+    "6061-T6 ALUM" was predicted as Aluminum 5052 - the wrong metal."""
+    assert job_intake_service._match_material_in_text("MATL: 6061-T6 ALUM") is None
+    assert job_intake_service._match_material_in_text("6061 ALUMINIUM") is None
+    # A bare generic word is still fine, and the stocked grade still matches.
+    assert job_intake_service._match_material_in_text("MATL: ALUM") == "Aluminum 5052"
+    assert job_intake_service._match_material_in_text("5052 ALUM") == "Aluminum 5052"
+
+
 def _dxf_with_text(path: Path, *texts: str) -> Path:
     """A minimal DXF carrying TEXT entities in the real group-code layout:
     each value is preceded by its group code on its own line, and entity text
