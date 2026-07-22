@@ -19,10 +19,12 @@ C:\Tools\.venv\Scripts\python.exe app.py
 | --- | --- |
 | `paths.py` | Shop paths, `JOB_PREFIX_TO_ROOT`, registry location. Change shop locations only here. |
 | `job_intake_registry.py` | Atomic JSON registry of intakes (`_runtime/job_intake_registry.json`). No Qt. |
-| `job_intake_service.py` | All orchestration: path resolution, folder creation, RPD clone, PO scraping, import-CSV build, RADAN/block wrappers. **No Qt** — keep it that way so a future listener can reuse it. |
+| `job_intake_service.py` | All orchestration: `create_intake` (the whole intake sequence), path resolution, folder creation, RPD clone, PO scraping, import-CSV build, RADAN/block wrappers. **No Qt** — that's what lets the listener reuse it. |
 | `job_intake_page.py` | `JobIntakePage` Qt widget: queue table, parts grid, action buttons, background polling. |
+| `job_intake_server.py` | Loopback HTTPS listener for the Outlook add-in. Owns no intake logic. |
+| `job_intake_tls.py` | Local root CA + loopback leaf cert, so Office gets the HTTPS it demands. |
 | `explorer_bridge.py` | Lazily loads `truck_nest_explorer`'s RADAN import + block transfer. |
-| `app.py` | Standalone window launcher. |
+| `app.py` | Standalone window launcher; also starts the listener on a daemon thread. |
 | `docs/PLAN.md` | Full design record incl. the unbuilt Outlook add-in phases. |
 
 ## Invariants — these are load-bearing, don't "simplify" them
@@ -49,6 +51,25 @@ C:\Tools\.venv\Scripts\python.exe app.py
   into the real truck machinery.
 - **Job numbers are opaque strings** — prefix letter + digits, never
   validated to a fixed width (5 digits may become 6).
+- **`job_intake_service.create_intake` is the only copy of the intake
+  sequence.** The desktop page passes `source="manual"`, the listener passes
+  `source="outlook"`; they differ in nothing else. Don't inline the
+  folder→copy→scrape→register steps into a caller again.
+- **The listener never triggers RADAN work.** It stages files and registers
+  the entry, then returns. RPD clone / part import / block transfer stay
+  desktop actions, so an Outlook request can't block on RADAN COM automation.
+  A test asserts no `.rpd` appears from a POST.
+- **Attachment names off the wire are untrusted** — reduced to a bare
+  filename before being joined to any path under `L:`, and restricted to
+  `.dxf`/`.pdf`. They come from an email.
+- **The loopback cert must carry both `localhost` and `127.0.0.1`.** Office
+  accepts either in a manifest's `SourceLocation` and a cert covering only one
+  fails on the other. `ensure_loopback_certificate()` must also stay
+  idempotent — regenerating on startup would invalidate the root CA the user
+  installed into the Windows trust store.
+- **`job_intake_tls.py` stays self-contained.** master_app has a near-identical
+  `web_tls`, but master_app embeds *this* repo, so importing it back would be
+  a dependency cycle.
 
 ## Job folder convention (verified against real shop folders)
 
@@ -102,13 +123,32 @@ Qt tests run offscreen (`QT_QPA_PLATFORM=offscreen`) with a module-scoped
 `sys.path`. PO tests build synthetic PDFs reproducing the verified
 cell-per-line layout. Isolate filesystem/registry work by monkeypatching
 `job_intake_service.BATTLESHIELD_ROOT`, `job_intake_service.EXPLORER_TEMPLATE_PATH`,
-and `job_intake_registry.JOB_INTAKE_REGISTRY_PATH`.
+and `job_intake_registry.JOB_INTAKE_REGISTRY_PATH`. Listener tests drive the
+Flask test client (no socket). TLS tests monkeypatch every `job_intake_tls`
+path constant — a test must never overwrite the real CA the user has trusted.
+
+## The listener
+
+Runs on a daemon thread started from `app.py`, bound to `127.0.0.1` only.
+`ODD_JOB_INTAKE_LISTENER=0` disables it; `ODD_JOB_INTAKE_PORT` overrides the
+default 8790. Auth is a bearer token generated into
+`_runtime/job_intake_api_token.key` on first run.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /api/job-intake` | Job number + base64 attachments → 201 with the entry summary |
+| `GET /api/job-intake/check?job_number=` | Reports `label_required` so the task pane knows whether to ask for a Label |
+| `GET /api/health` | **Unauthenticated on purpose** — lets the task pane tell "app not running" from "bad token" |
+| `GET /job-intake-root-ca.crt` | The CA to install into the Windows trust store |
+
+Run it alone for debugging with
+`C:\Tools\.venv\Scripts\python.exe job_intake_server.py`, which prints the
+port, the CA path, and the token.
 
 ## Status
 
-Phase 1 (folder + RPD + parts grid + RADAN import + block transfer) is built
-and tested. The **Outlook 365 add-in is designed but not built** — a local
-`127.0.0.1` HTTPS listener that accepts a job number plus base64 DXF
-attachments and calls the same service functions with `source="outlook"`,
-plus a task-pane manifest. See `docs/PLAN.md` (Phases 2–3), including the
-flagged risk that Office's webview may reject a self-signed cert.
+Phases 1 and 2 are built, tested, and live-verified. **Phase 3 (the Outlook
+task pane) is not built.** The self-signed-cert risk was spiked and is *not* a
+blocker, but it needs the root CA in the Windows trust store and a WebView2
+loopback exemption — see `docs/PLAN.md`, which has the exact command and the
+current state of this machine.

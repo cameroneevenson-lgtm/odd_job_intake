@@ -1,3 +1,6 @@
 PySide6
 PyMuPDF
+# the loopback listener the Outlook add-in posts to (job_intake_server.py)
+Flask
+cryptography
 pytest

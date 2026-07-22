@@ -5,7 +5,13 @@ Runs the same JobIntakePage that master_app can embed, in its own window.
 
 from __future__ import annotations
 
+import logging
+import os
 import sys
+
+
+def _listener_enabled() -> bool:
+    return os.environ.get("ODD_JOB_INTAKE_LISTENER", "1").strip().lower() not in {"0", "false", "no"}
 
 
 def main() -> int:
@@ -15,6 +21,16 @@ def main() -> int:
     from job_intake_page import JobIntakePage
 
     app = QApplication.instance() or QApplication(sys.argv)
+
+    if _listener_enabled():
+        # Daemon thread, loopback only. A failure here (port in use, no cert)
+        # is logged inside start_listener and must never stop the desktop app.
+        try:
+            from job_intake_server import start_listener
+
+            start_listener()
+        except Exception:
+            logging.getLogger(__name__).exception("Could not start the job intake listener.")
 
     try:
         explorer_api = load_explorer_api()

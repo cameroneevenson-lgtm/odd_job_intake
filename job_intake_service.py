@@ -16,6 +16,7 @@ import re
 import shutil
 from typing import Any
 
+import job_intake_registry
 from paths import (
     BATTLESHIELD_ROOT,
     EXPLORER_TEMPLATE_PATH,
@@ -155,6 +156,85 @@ def copy_attachments(paths: JobPaths, source_files: list[Path]) -> list[dict[str
             {"filename": source.name, "saved_path": str(target), "size": target.stat().st_size}
         )
     return attachments
+
+
+def create_intake(
+    job_number: str,
+    label: str | None,
+    files: list[Path],
+    *,
+    source: str = "manual",
+    email_subject: str = "",
+    email_sender: str = "",
+) -> dict[str, Any]:
+    """Create the job folder, copy attachments in, scrape whatever the PO PDFs
+    give up, seed one part row per DXF, and register the intake.
+
+    This is the whole intake sequence and the only copy of it: the desktop page
+    and the 127.0.0.1 listener both call this, differing only in ``source``.
+    It deliberately stops short of any RADAN work - cloning the RPD, importing
+    parts, and sending blocks stay explicit user actions on the desktop page,
+    so an Outlook-driven intake can never block on RADAN COM automation.
+    """
+    paths = resolve_job_paths(job_number, label or None)
+    create_job_folders(paths)
+    attachments = copy_attachments(paths, list(files))
+
+    dxf_names = [
+        attachment["filename"]
+        for attachment in attachments
+        if str(attachment["filename"]).casefold().endswith(".dxf")
+    ]
+    dxf_stems = [Path(name).stem for name in dxf_names]
+
+    po_number: str | None = None
+    due_date: date | None = None
+    due_note: str | None = None
+    line_items: dict[str, dict[str, Any]] = {}
+    unmatched: list[str] = []
+    for attachment in attachments:
+        filename = str(attachment["filename"])
+        if filename.casefold().endswith(".dxf") or not filename.casefold().endswith(".pdf"):
+            continue
+        hints = extract_po_hints(Path(attachment["saved_path"]), dxf_stems)
+        po_number = po_number or hints.po_number
+        due_date = due_date or hints.due_date
+        due_note = due_note or hints.due_note
+        for stem, hint in hints.line_items.items():
+            line_items.setdefault(stem, hint)
+        unmatched.extend(line for line in hints.unmatched_lines if line not in unmatched)
+
+    material_qty = []
+    for name in dxf_names:
+        hint = line_items.get(Path(name).stem, {})
+        material_qty.append(
+            {
+                "filename": name,
+                "material": "",
+                "thickness": 0.0,
+                "qty": int(hint.get("qty") or 1),
+                "unit": "in",
+                "strategy": "",
+                "po_ref": str(hint.get("raw_description", "") or ""),
+            }
+        )
+
+    entry = job_intake_registry.new_entry(
+        job_number=job_number,
+        label=label or None,
+        source=source,
+        email_subject=email_subject,
+        email_sender=email_sender,
+    )
+    entry["job_folder"] = str(paths.intake_dir)
+    entry["po_number"] = po_number
+    entry["due_date"] = due_date.isoformat() if due_date else None
+    entry["due_note"] = due_note
+    entry["attachments"] = attachments
+    entry["material_qty"] = material_qty
+    entry["po_unmatched"] = unmatched
+    job_intake_registry.append_entry(entry)
+    return entry
 
 
 # --- RPD template clone ------------------------------------------------------

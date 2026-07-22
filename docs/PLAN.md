@@ -134,9 +134,52 @@ Data flow: request -> token check -> fast path only (create/detect job folder pe
 
 **Phases 2–3 are unchanged** (see sections above); Phase 2's listener reuses `job_intake_service`/`job_intake_registry` exactly as built — the `source="outlook"` path is `new_entry(source="outlook", ...)` + the same create/copy/extract sequence, nothing new in the service layer.
 
+## HANDOFF — PHASE 2 COMPLETE. Remaining: Phase 3 (Outlook add-in).
+
+**Built and live-verified over a real HTTPS socket.** Three new files:
+
+- `job_intake_service.create_intake(job_number, label, files, *, source, email_subject, email_sender)` — the intake sequence was **moved off the Qt page into the service**. It is now the single copy: `JobIntakePage._create_intake` delegates to it with `source="manual"`, the listener calls it with `source="outlook"`. Do not reintroduce the sequence in a caller.
+- `job_intake_tls.py` — self-contained local root CA + leaf cert. Self-contained on purpose: master_app has a similar `web_tls`, but master_app now *embeds* this repo, so importing it back would be a dependency cycle.
+- `job_intake_server.py` — Flask app on `127.0.0.1` only, bearer token from `_runtime/job_intake_api_token.key`, started as a daemon thread from `app.py` (disable with `ODD_JOB_INTAKE_LISTENER=0`, port via `ODD_JOB_INTAKE_PORT`, default 8790).
+
+Routes: `POST /api/job-intake` (job number + base64 attachments → 201 with the entry summary), `GET /api/job-intake/check?job_number=` (→ `label_required`, so the task pane knows whether to show its Label field), `GET /api/health` (**unauthenticated by design** — lets the task pane distinguish "desktop app isn't running" from "bad token"), `GET /job-intake-root-ca.crt` (for the Windows trust-store install).
+
+**Settled implementation facts:**
+- **The listener triggers no RADAN work**, as designed — it creates the folder, decodes attachments, scrapes the PO, and registers the entry, then returns. A test asserts no `.rpd` is produced. RPD/import/blocks stay desktop actions.
+- Attachments are accepted only as `.dxf`/`.pdf`, and each name is reduced to a bare filename before being joined to a path under `L:` — an emailed attachment name is untrusted input and `..\..\` traversal is stripped (tested).
+- At least one `.dxf` is required; a PDF-only submission is refused.
+- **Resubmitting a job returns 400 asking for a Label, not 409** — `create_job_folders`'s existing-folder guard fires before the registry's duplicate-key check. The 409 branch is only reachable when the folder was deleted by hand but the registry entry remains.
+- Uses Flask's threaded WSGI server, **not waitress** (which has no built-in TLS termination). Correct for one user's occasional single requests on loopback.
+- `ensure_loopback_certificate()` is idempotent and reuses existing material — it must be, or every startup would invalidate the CA the user installed into Windows.
+
+### Phase 3 cert spike — NOT a blocker, but there are two extra steps
+
+The flagged risk was that Office's webview might reject a self-signed cert. It does not, **provided the root CA is installed into the Windows "Trusted Root Certification Authorities" store** (per-user is enough). Two findings that are easy to lose a day to:
+
+1. **The cert must cover both `localhost` (DNS) and `127.0.0.1` (IP).** Office accepts either spelling in a manifest's `SourceLocation`, and a cert issued for only one fails on the other — this is a known footgun (OfficeDev/Office-Addin-Scripts#514). `job_intake_tls` puts both in the SAN and a test pins it.
+2. **WebView2 needs a loopback exemption.** The Office webview app container blocks loopback by default; without this the task pane fails with an opaque "we can't open this add-in from localhost". In an **admin** PowerShell:
+   ```
+   CheckNetIsolation LoopbackExempt -a -n="microsoft.win32webviewhost_cw5n1h2txyewy"
+   ```
+   Checked on this machine (2026-07-22): **no exemption is currently registered**, so this step is still outstanding. It is a system change requiring admin, so it was documented rather than applied.
+
+Sanity check before writing any add-in code: open `https://127.0.0.1:8790/api/health` in Edge — no cert warning means the trust half is done.
+
+Because the task pane HTML will be served by this same listener, the pane is same-origin with the API and **no CORS configuration is needed**. Serving it from elsewhere would change that.
+
+## Future work — better material/qty extraction when there is no PO
+
+Today extraction only runs against non-DXF PDF attachments, so a job emailed without a PO document falls back to fully manual entry. Worth pursuing, roughly in order of expected payoff:
+
+- **Scrape the email's own plain-text body.** Often the material and quantities are simply typed in the message ("2 off, 1/4 mild steel") when no formal PO is attached. The listener already receives the email context, so the body would just become another `POHints` source. Material stays reference-only per the existing data-entry rule — the same inconsistent-spelling problem applies, and arguably worse in free-form prose.
+- **PDF drawing prints, not just POs.** Job folders routinely contain a second, non-PO PDF (the drawings), and its title block carries material/thickness per part. `truck_nest_explorer` already does title-block text extraction with PyMuPDF for a similar purpose — worth looking at before writing anything new.
+- **Text embedded in the DXF/DWG itself.** TEXT/MTEXT entities and the drawing's own title block frequently name material and thickness. This is the most reliable source of the three when present (it is the designer's own value, not a salesperson's retyping) and the only one available when the DXF arrives with no accompanying document at all. DXF is plain text and parseable directly; DWG would need a converter.
+
+All three feed the same best-effort contract: pre-fill Qty (and possibly show thickness as reference), never auto-fill Material, and surface anything unmatched rather than guessing.
+
 ## Verification
 
 - **Phase 1**: run the desktop app (`dev_run.bat`), open the new Job Intake tab, use "Manual Intake" with a real small DXF set and a test job number (e.g. a fresh `M9####...` number and, separately, an existing job number to exercise the Label-required branch), fill in material/thickness/qty/due-date/estimates, generate the RPD, confirm the resulting `.rpd`/folder shape matches the `M59919` convention exactly, confirm parts appear correctly in RADAN, and test "Send Blocks to Machine" once nests/`.cnc` files exist.
-- **Phase 2**: with the desktop app running, `curl`/Postman a POST to `https://127.0.0.1:8790/api/job-intake` with a test payload (bearer token + base64 DXF), confirm the job folder is created and the registry entry appears, and confirm it shows up in the Job Intake tab's queue on next poll/refresh — before writing any Outlook-side code.
+- **Phase 2** (done): verified against a real HTTPS socket on 127.0.0.1 with TLS validated against the generated root CA — health, token rejection, a two-DXF submission landing in the correct `M-FABRICATION/<job>` shape with `source="outlook"` and no `.rpd`, the resubmit guard, and the root-CA download route. The `localhost` spelling was confirmed to validate against the same cert. Still worth doing by hand once against the real `L:` drive with the desktop app running, to confirm the intake appears in the tab's queue on the next poll.
 - **Phase 3**: sideload the manifest in Outlook (desktop or web), confirm the task pane loads over HTTPS without a cert warning (post-trust), submit a real test email's DXF attachments, and confirm the same end-to-end flow as Phase 1/2 completes.
 - Run each existing test suite (`master_app/tests/`, `truck_nest_explorer/tests/`) after each phase to confirm no regressions in the embedding/navigation code touched.

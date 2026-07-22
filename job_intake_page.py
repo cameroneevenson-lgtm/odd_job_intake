@@ -11,7 +11,6 @@ which is touched lazily inside button handlers - never at construction time
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import date, datetime
 from pathlib import Path
 import time
 from typing import Any
@@ -544,61 +543,10 @@ class JobIntakePage(QWidget):
         self.refresh()
 
     def _create_intake(self, job_number: str, label: str, files: list[Path]) -> dict[str, Any]:
-        """Create the job folder, copy attachments, scrape PO hints, and
-        register the intake. Separated from the dialog so tests can drive it."""
-        paths = job_intake_service.resolve_job_paths(job_number, label or None)
-        job_intake_service.create_job_folders(paths)
-        attachments = job_intake_service.copy_attachments(paths, files)
-
-        dxf_names = [
-            attachment["filename"]
-            for attachment in attachments
-            if str(attachment["filename"]).casefold().endswith(".dxf")
-        ]
-        dxf_stems = [Path(name).stem for name in dxf_names]
-
-        po_number: str | None = None
-        due_date: date | None = None
-        due_note: str | None = None
-        line_items: dict[str, dict[str, Any]] = {}
-        unmatched: list[str] = []
-        for attachment in attachments:
-            filename = str(attachment["filename"])
-            if filename.casefold().endswith(".dxf") or not filename.casefold().endswith(".pdf"):
-                continue
-            hints = job_intake_service.extract_po_hints(Path(attachment["saved_path"]), dxf_stems)
-            po_number = po_number or hints.po_number
-            due_date = due_date or hints.due_date
-            due_note = due_note or hints.due_note
-            for stem, hint in hints.line_items.items():
-                line_items.setdefault(stem, hint)
-            unmatched.extend(line for line in hints.unmatched_lines if line not in unmatched)
-
-        material_qty = []
-        for name in dxf_names:
-            hint = line_items.get(Path(name).stem, {})
-            material_qty.append(
-                {
-                    "filename": name,
-                    "material": "",
-                    "thickness": 0.0,
-                    "qty": int(hint.get("qty") or 1),
-                    "unit": "in",
-                    "strategy": "",
-                    "po_ref": str(hint.get("raw_description", "") or ""),
-                }
-            )
-
-        entry = job_intake_registry.new_entry(job_number=job_number, label=label or None, source="manual")
-        entry["job_folder"] = str(paths.intake_dir)
-        entry["po_number"] = po_number
-        entry["due_date"] = due_date.isoformat() if due_date else None
-        entry["due_note"] = due_note
-        entry["attachments"] = attachments
-        entry["material_qty"] = material_qty
-        entry["po_unmatched"] = unmatched
-        job_intake_registry.append_entry(entry)
-        return entry
+        """Testable seam the Manual Intake dialog calls. The sequence itself
+        lives in job_intake_service so the 127.0.0.1 listener runs the same
+        code path with source="outlook"."""
+        return job_intake_service.create_intake(job_number, label or None, files, source="manual")
 
     def _save_details(self) -> dict[str, Any] | None:
         entry = self._selected_entry()
