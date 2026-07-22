@@ -633,6 +633,199 @@ def clone_rpd_template(paths: JobPaths, template_path: Path = EXPLORER_TEMPLATE_
     return paths.rpd_path
 
 
+# --- delete / rename ---------------------------------------------------------
+#
+# Both operate on real shop folders, so both refuse to touch anything outside
+# BATTLESHIELD_ROOT and both report exactly what they did.
+
+# Files whose *contents* reference the project name. Both are XML despite the
+# extensions: an .rpd holds it ~40 times and a nest .drg ~27, in element text
+# and in path attributes, so renaming the files alone leaves RADAN pointing at
+# a project that no longer exists.
+RENAMEABLE_CONTENT_SUFFIXES = (".rpd", ".drg")
+
+
+def _assert_under_shop_root(target: Path) -> None:
+    root = BATTLESHIELD_ROOT.resolve()
+    try:
+        resolved = target.resolve()
+    except OSError as exc:
+        raise JobIntakeError(f"Could not resolve {target}: {exc}") from exc
+    if not resolved.is_relative_to(root):
+        raise JobIntakeError(
+            f"Refusing to touch {resolved} - it is outside {root}."
+        )
+
+
+def delete_job_files(entry: dict[str, Any]) -> str:
+    """Remove an intake's folder from the shop drive.
+
+    The registry entry is the caller's business; this only handles the files,
+    and only inside BATTLESHIELD_ROOT.
+    """
+    folder_text = str(entry.get("job_folder") or "")
+    if not folder_text:
+        return "No job folder recorded for this intake."
+    folder = Path(folder_text)
+    if not folder.exists():
+        return f"{folder} no longer exists."
+
+    _assert_under_shop_root(folder)
+    file_count = sum(1 for _ in folder.rglob("*") if _.is_file())
+    shutil.rmtree(folder)
+    return f"Deleted {folder} ({file_count} file(s))."
+
+
+@dataclass(frozen=True)
+class RenamePlan:
+    old_job_number: str
+    new_job_number: str
+    old_project_name: str
+    new_project_name: str
+    old_intake_dir: Path
+    new_intake_dir: Path
+    files_to_rename: tuple[tuple[Path, str], ...]
+    files_to_rewrite: tuple[Path, ...]
+
+    def describe(self) -> str:
+        lines = [
+            f"Folder:  {self.old_intake_dir}",
+            f"     ->  {self.new_intake_dir}",
+        ]
+        if self.files_to_rename:
+            lines.append(f"Rename {len(self.files_to_rename)} file(s):")
+            lines += [f"    {path.name}  ->  {new}" for path, new in self.files_to_rename]
+        if self.files_to_rewrite:
+            lines.append(
+                f"Rewrite references inside {len(self.files_to_rewrite)} file(s): "
+                + ", ".join(sorted({path.suffix for path in self.files_to_rewrite}))
+            )
+        return "\n".join(lines)
+
+
+def plan_job_rename(
+    entry: dict[str, Any],
+    new_job_number: str,
+    new_label: str | None,
+    *,
+    include_part_files: bool = False,
+) -> RenamePlan:
+    """Work out everything a rename touches, without changing anything.
+
+    Separated from the doing so the user can be shown it first - this moves
+    real folders on L: and edits files RADAN depends on.
+    """
+    old_number = str(entry.get("job_number", "") or "").strip().upper()
+    old_label = entry.get("label")
+    new_number = str(new_job_number or "").strip().upper()
+    new_label_text = str(new_label or "").strip() or None
+
+    if not new_number:
+        raise JobIntakeError("Enter a new job number.")
+    resolve_job_root(new_number)
+    if new_number == old_number and (new_label_text or "") == (old_label or ""):
+        raise JobIntakeError("That is already this job's number and label.")
+
+    old_paths = resolve_job_paths(old_number, old_label)
+    new_paths = resolve_job_paths(new_number, new_label_text)
+
+    if not old_paths.intake_dir.exists():
+        raise JobIntakeError(f"{old_paths.intake_dir} does not exist.")
+    if new_paths.intake_dir.exists():
+        raise JobIntakeError(f"{new_paths.intake_dir} already exists.")
+    _assert_under_shop_root(old_paths.intake_dir)
+    _assert_under_shop_root(new_paths.intake_dir)
+
+    renames: list[tuple[Path, str]] = []
+    rewrites: list[Path] = []
+    for path in sorted(old_paths.intake_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix.casefold() in RENAMEABLE_CONTENT_SUFFIXES:
+            rewrites.append(path)
+
+        # Part files are the customer's own numbering, and the registry rows
+        # reference them by name, so they are left alone unless explicitly
+        # asked for. The project's own files - the RPD, its nests, the nest
+        # summary - carry the job number as part of the project's identity and
+        # always move with it.
+        is_part_file = path.suffix.casefold() in (".dxf", ".sym") or (
+            path.suffix.casefold() == ".pdf" and "NEST" not in path.name.upper()
+        )
+        if is_part_file and not include_part_files:
+            continue
+
+        # Any file carrying the old project name in its own name, not just
+        # RPD/DRG - the nests are called "P1 <project>.drg" and symbols and
+        # summaries follow the same habit.
+        if old_paths.project_name in path.name or old_number in path.name:
+            new_name = path.name.replace(old_paths.project_name, new_paths.project_name)
+            new_name = new_name.replace(old_number, new_number)
+            if new_name != path.name:
+                renames.append((path, new_name))
+
+    return RenamePlan(
+        old_job_number=old_number,
+        new_job_number=new_number,
+        old_project_name=old_paths.project_name,
+        new_project_name=new_paths.project_name,
+        old_intake_dir=old_paths.intake_dir,
+        new_intake_dir=new_paths.intake_dir,
+        files_to_rename=tuple(renames),
+        files_to_rewrite=tuple(rewrites),
+    )
+
+
+def apply_job_rename(plan: RenamePlan) -> str:
+    """Carry out a rename plan: rewrite contents, rename files, move folders.
+
+    Contents are rewritten before anything moves, so a failure part-way leaves
+    the job where it was rather than half-renamed under a new path.
+    """
+    rewritten = 0
+    for path in plan.files_to_rewrite:
+        try:
+            text = _decode_template_bytes(path.read_bytes())
+        except JobIntakeError:
+            continue
+        updated = text.replace(plan.old_project_name, plan.new_project_name)
+        updated = updated.replace(plan.old_job_number, plan.new_job_number)
+        # Paths embedded in the file point at the old folder too.
+        updated = updated.replace(str(plan.old_intake_dir), str(plan.new_intake_dir))
+        if updated != text:
+            path.write_text(updated, encoding="utf-8")
+            rewritten += 1
+
+    renamed = 0
+    # Deepest first, so renaming a file never depends on its parent's name.
+    for path, new_name in sorted(
+        plan.files_to_rename, key=lambda pair: len(pair[0].parts), reverse=True
+    ):
+        if path.exists():
+            path.rename(path.with_name(new_name))
+            renamed += 1
+
+    # The inner project directory carries the project name as well.
+    for directory in sorted(
+        (item for item in plan.old_intake_dir.rglob("*") if item.is_dir()),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        new_name = directory.name.replace(plan.old_project_name, plan.new_project_name)
+        new_name = new_name.replace(plan.old_job_number, plan.new_job_number)
+        if new_name != directory.name:
+            directory.rename(directory.with_name(new_name))
+
+    plan.new_intake_dir.parent.mkdir(parents=True, exist_ok=True)
+    plan.old_intake_dir.rename(plan.new_intake_dir)
+
+    return (
+        f"Renamed to {plan.new_project_name}: {renamed} file(s) renamed, "
+        f"{rewritten} file(s) had their internal references updated, "
+        f"folder now {plan.new_intake_dir}."
+    )
+
+
 # --- Material list -----------------------------------------------------------
 
 

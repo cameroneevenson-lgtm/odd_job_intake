@@ -285,6 +285,48 @@ class ManualIntakeDialog(QDialog):
         return self.job_number_edit.text().strip().upper(), self.label_edit.text().strip()
 
 
+class RenameJobDialog(QDialog):
+    """New job number / label, and whether the part files move with it."""
+
+    def __init__(self, job_number: str, label: str | None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Rename Job")
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.job_number_edit = QLineEdit(job_number)
+        self.label_edit = QLineEdit(str(label or ""))
+        form.addRow("New job number", self.job_number_edit)
+        form.addRow("Label", self.label_edit)
+        layout.addLayout(form)
+
+        self.include_parts_check = QCheckBox("Also rename the part files (DXF/SYM/PDF)")
+        self.include_parts_check.setChecked(False)
+        layout.addWidget(self.include_parts_check)
+
+        note = QLabel(
+            "Part files carry the customer's own numbering, so they are left alone "
+            "by default. The RPD, its nests and the nest summary always move with "
+            "the job, and the references inside them are rewritten."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("page_subtitle")
+        layout.addWidget(note)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> tuple[str, str, bool]:
+        return (
+            self.job_number_edit.text().strip().upper(),
+            self.label_edit.text().strip(),
+            self.include_parts_check.isChecked(),
+        )
+
+
 class JobIntakePage(QWidget):
     def __init__(self, *, explorer_api: Any, parent: QWidget | None = None):
         super().__init__(parent)
@@ -409,6 +451,10 @@ class JobIntakePage(QWidget):
         self.import_button.clicked.connect(self._import_parts)
         self.send_blocks_button = QPushButton("Send Blocks to Machine")
         self.send_blocks_button.clicked.connect(self._send_blocks)
+        self.rename_button = QPushButton("Rename Job")
+        self.rename_button.clicked.connect(self._rename_job)
+        self.delete_button = QPushButton("Delete Intake")
+        self.delete_button.clicked.connect(self._delete_intake)
         self.apply_bom_button = QPushButton("Apply BOM (inventor_to_radan)")
         self.apply_bom_button.clicked.connect(self._apply_bom)
         self.full_flow_button = QPushButton("Run Full Flow")
@@ -426,6 +472,8 @@ class JobIntakePage(QWidget):
             self.send_blocks_button,
             self.open_folder_button,
             self.open_rpd_button,
+            self.rename_button,
+            self.delete_button,
         ):
             actions.addWidget(button)
         actions.addStretch(1)
@@ -776,6 +824,116 @@ class JobIntakePage(QWidget):
         lives in job_intake_service so the 127.0.0.1 listener runs the same
         code path with source="outlook"."""
         return job_intake_service.create_intake(job_number, label or None, files, source="manual")
+
+    def _delete_intake(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        key = str(entry.get("key", ""))
+        folder = str(entry.get("job_folder") or "")
+
+        prompt = f"Remove the intake {key} from the queue?"
+        if folder:
+            prompt += (
+                f"\n\nIts folder is:\n{folder}\n\n"
+                "Choose Yes to delete the folder too, No to keep the files and "
+                "only remove the queue entry."
+            )
+        answer = QMessageBox.question(
+            self,
+            "Delete Intake",
+            prompt,
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer == QMessageBox.Cancel:
+            return
+
+        message = ""
+        if answer == QMessageBox.Yes and folder:
+            try:
+                message = job_intake_service.delete_job_files(entry)
+            except JobIntakeError as exc:
+                QMessageBox.warning(self, "Delete Intake", str(exc))
+                return
+
+        job_intake_registry.delete_entry(key)
+        self._selected_key = None
+        self.refresh()
+        self.activity_label.setText(f"Removed {key}. {message}".strip())
+
+    def _rename_job(self) -> None:
+        """Renumber a job: folders, project files, and the references inside
+        them.
+
+        Shown as a plan first. This moves real folders on L: and edits files
+        RADAN depends on, so it is not something to do on a mis-click.
+        """
+        entry = self._selected_entry()
+        if entry is None:
+            return
+
+        dialog = RenameJobDialog(
+            str(entry.get("job_number", "")), entry.get("label"), self
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        new_number, new_label, include_parts = dialog.values()
+
+        try:
+            plan = job_intake_service.plan_job_rename(
+                entry, new_number, new_label, include_part_files=include_parts
+            )
+        except JobIntakeError as exc:
+            QMessageBox.warning(self, "Rename Job", str(exc))
+            return
+
+        confirmed = QMessageBox.question(
+            self,
+            "Rename Job",
+            "This will change files on the shop drive:\n\n"
+            + plan.describe()
+            + "\n\nProceed?",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if confirmed != QMessageBox.Yes:
+            return
+
+        try:
+            message = job_intake_service.apply_job_rename(plan)
+        except (JobIntakeError, OSError) as exc:
+            QMessageBox.warning(self, "Rename Job", f"The rename failed:\n\n{exc}")
+            return
+
+        # The registry key is derived from number + label, so the old entry is
+        # replaced rather than updated in place.
+        old_key = str(entry.get("key", ""))
+        entry["job_number"] = plan.new_job_number
+        entry["label"] = new_label or None
+        entry["key"] = job_intake_registry.entry_key(plan.new_job_number, new_label)
+        entry["job_folder"] = str(plan.new_intake_dir)
+        if entry.get("rpd_path"):
+            entry["rpd_path"] = str(
+                plan.new_intake_dir
+                / plan.new_project_name
+                / f"{plan.new_project_name}.rpd"
+            )
+        if include_parts:
+            for part in entry.get("material_qty", []):
+                part["filename"] = str(part.get("filename", "")).replace(
+                    plan.old_job_number, plan.new_job_number
+                )
+            for attachment in entry.get("attachments", []):
+                attachment["filename"] = str(attachment.get("filename", "")).replace(
+                    plan.old_job_number, plan.new_job_number
+                )
+
+        job_intake_registry.delete_entry(old_key)
+        job_intake_registry.append_entry(entry)
+        self._selected_key = str(entry["key"])
+        self.refresh()
+        self.activity_label.setText(message)
 
     def _apply_bom(self) -> None:
         """Re-run a spreadsheet BOM through inventor_to_radan.
