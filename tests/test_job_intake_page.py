@@ -141,6 +141,9 @@ def test_unit_and_strategy_are_hidden_but_still_feed_the_radan_import(qapp, isol
 
         page.parts_table.item(0, PART_MATERIAL_COL).setText("Stainless Steel")
         page.parts_table.item(0, PART_THICKNESS_COL).setText("0.25")
+        # Nothing stated a quantity for this bare DXF, and an unanswered one
+        # blocks the import - typing it is the answer.
+        page.parts_table.item(0, PART_QTY_COL).setText("3")
         page._save_details()
 
         entry = job_intake_registry.get_entry("M50777")

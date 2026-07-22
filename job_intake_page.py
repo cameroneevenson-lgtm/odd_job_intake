@@ -355,6 +355,10 @@ class JobIntakePage(QWidget):
         self._entries: list[dict[str, Any]] = []
         self._selected_key: str | None = None
         self._loading_detail = False
+        # Rows whose quantity nobody stated, and the ones a human has since
+        # answered - kept per selected entry, reset when the grid reloads.
+        self._unknown_qty_rows: dict[int, bool] = {}
+        self._qty_answered: set[int] = set()
         self._import_process: Any = None
         self._import_context: tuple[str, Path] | None = None
         self._blocks_executor = ThreadPoolExecutor(max_workers=1)
@@ -645,6 +649,8 @@ class JobIntakePage(QWidget):
             self.bend_hours_spin.setValue(float(entry.get("bend_hours") or 0.0))
 
             parts = list(entry.get("material_qty", []))
+            self._unknown_qty_rows = {}
+            self._qty_answered = set()
             self.parts_table.blockSignals(True)
             try:
                 self.parts_table.setRowCount(len(parts))
@@ -663,6 +669,7 @@ class JobIntakePage(QWidget):
                     )
                     confirmed = bool(part.get("material_confirmed"))
                     qty_unknown = bool(part.get("qty_unknown"))
+                    self._unknown_qty_rows[row] = qty_unknown
                     for column, value in enumerate(values):
                         item = QTableWidgetItem(value)
                         if column in (
@@ -735,6 +742,14 @@ class JobIntakePage(QWidget):
             )
             return
 
+        # Typing a quantity is the answer to "nobody stated one" - drop the
+        # placeholder tint and let the import proceed.
+        if item.column() == PART_QTY_COL:
+            self._qty_answered.add(item.row())
+            item.setData(Qt.ItemDataRole.BackgroundRole, None)
+            item.setToolTip("")
+            return
+
         if item.column() != PART_MATERIAL_COL:
             return
         material = item.text()
@@ -800,6 +815,11 @@ class JobIntakePage(QWidget):
                     "material_confirmed": (
                         verified_item is not None
                         and verified_item.checkState() == Qt.CheckState.Checked
+                    ),
+                    # Cleared once a human types a quantity, whatever it is.
+                    "qty_unknown": (
+                        bool(self._unknown_qty_rows.get(row))
+                        and row not in self._qty_answered
                     ),
                 }
             )

@@ -450,6 +450,18 @@ def create_intake(
         # own words; the email was typed for this job but in prose; a print's
         # title block is a drawing note; the DXF's own text is the last resort.
         cam_row = cam_rows.get(Path(name).stem.casefold())
+
+        # A DXF the parts list doesn't mention. There may be a good reason for
+        # it or it may be a mistake, but either way it is a question for
+        # engineering rather than something to resolve from the drawing - so it
+        # is named rather than quietly filled in from the print.
+        if (cam_rows or bom_rows) and cam_row is None and Path(name).stem not in bom_rows:
+            note = (
+                f"{name}: this DXF isn't in the BOM. Check with engineering - "
+                f"there may be a reason, or the BOM may have missed it."
+            )
+            if note not in unmatched:
+                unmatched.append(note)
         material = (
             (cam_row["material"] if cam_row else None)
             or bom_material
@@ -2324,6 +2336,17 @@ def build_import_csv_rows(entry: dict[str, Any]) -> list[list[str]]:
             continue
         if not isinstance(qty, int) or qty <= 0:
             problems.append(f"{filename}: quantity must be at least 1")
+            continue
+        # Nothing stated a quantity, so the 1 in the row is a placeholder. Let
+        # it through and a forty-off part gets cut once - so someone has to put
+        # a real number in, even if that number turns out to be 1.
+        if part.get("qty_unknown"):
+            source = str(part.get("qty_source_text", "") or "").strip()
+            detail = f' (the print says "{source}")' if source else ""
+            problems.append(
+                f"{filename}: no quantity was stated{detail} - set the real "
+                f"quantity, the 1 shown is a placeholder"
+            )
             continue
         unit = str(part.get("unit", "") or "in").strip().casefold()
         strategy = str(part.get("strategy", "") or "").strip() or default_strategy_for_material(material)
