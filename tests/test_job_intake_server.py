@@ -205,6 +205,38 @@ def test_non_dxf_pdf_attachments_are_refused(client) -> None:
     assert "logo.png" in response.get_json()["error"]
 
 
+def test_an_email_that_is_only_a_folder_path_is_accepted(client, tmp_path: Path) -> None:
+    """Some jobs arrive as a path to W: with no attachments at all, so an
+    empty attachment list is only fatal when the body names no folder."""
+    shared = tmp_path / "W" / "LASER" / "Job 123"
+    shared.mkdir(parents=True)
+
+    response = client.post(
+        "/api/job-intake",
+        json=_payload(
+            job_number="M90777",
+            attachments=[],
+            email_body=f"Parts are here:\n{shared}\nthanks",
+        ),
+        headers=AUTH,
+    )
+    assert response.status_code == 201, response.get_json()
+
+    entry = job_intake_registry.load_entries()[0]
+    assert str(shared) in entry["source_paths"]
+    assert "Parts are here" in entry["email_body"]
+
+
+def test_a_path_that_does_not_exist_is_not_recorded_as_a_source(client) -> None:
+    response = client.post(
+        "/api/job-intake",
+        json=_payload(email_body=r"see W:\nope\missing folder"),
+        headers=AUTH,
+    )
+    assert response.status_code == 201
+    assert job_intake_registry.load_entries()[0]["source_paths"] == []
+
+
 def test_a_request_with_no_dxf_is_refused(client) -> None:
     response = client.post(
         "/api/job-intake",
@@ -218,7 +250,7 @@ def test_a_request_with_no_dxf_is_refused(client) -> None:
 @pytest.mark.parametrize(
     "attachments, expected",
     [
-        ([], "at least one"),
+        ([], "nothing to nest"),
         ([{"name": "a.dxf", "contentBytes": "not base64!!"}], "base64"),
         ([{"name": "a.dxf", "contentBytes": ""}], "empty"),
         ([{"name": "", "contentBytes": "AAAA"}], "unusable"),

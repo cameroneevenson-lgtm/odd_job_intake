@@ -130,7 +130,7 @@ Private Function BuildPayload(mail As Outlook.MailItem, jobNumber As String, _
                               jobLabel As String) As String
     Dim att As Outlook.Attachment
     Dim tempDir As String, savedPath As String
-    Dim items As String, name As String
+    Dim items As String, name As String, body As String
     Dim dxfCount As Long, sentCount As Long
 
     tempDir = GetTempDir()
@@ -153,21 +153,65 @@ Private Function BuildPayload(mail As Outlook.MailItem, jobNumber As String, _
         End If
     Next
 
-    If sentCount = 0 Then
-        MsgBox "This email has no .dxf or .pdf attachments.", vbExclamation, "Job Intake"
+    ' Some jobs arrive as a path to W: with no attachments at all, so an empty
+    ' attachment list is only a problem when the body has no path either.
+    ' Everything beyond that check is the server's call - see the note on
+    ' email_body below.
+    body = BodyText(mail)
+    If sentCount = 0 And Not LooksLikeAPath(body) Then
+        MsgBox "This email has no .dxf/.pdf attachments and no folder path in " & _
+               "the message body - there's nothing to file.", vbExclamation, "Job Intake"
         Exit Function
     End If
-    If dxfCount = 0 Then
+    If sentCount > 0 And dxfCount = 0 And Not LooksLikeAPath(body) Then
         MsgBox "This email has no .dxf attachment - there would be nothing to nest.", _
                vbExclamation, "Job Intake"
         Exit Function
     End If
 
+    ' The body is sent raw and parsed server-side on purpose. Finding paths,
+    ' materials and quantities in it is guesswork that will keep changing, and
+    ' changing it in Python costs nothing while changing it here means
+    ' re-importing and re-signing this macro on every machine. Send the
+    ' evidence, decide in Python.
     BuildPayload = "{""job_number"":""" & JsonEscape(jobNumber) & """," & _
                    """label"":""" & JsonEscape(jobLabel) & """," & _
                    """email_subject"":""" & JsonEscape(mail.Subject) & """," & _
                    """email_sender"":""" & JsonEscape(SenderAddress(mail)) & """," & _
+                   """email_received"":""" & JsonEscape(ReceivedStamp(mail)) & """," & _
+                   """email_body"":""" & JsonEscape(body) & """," & _
                    """attachments"":[" & items & "]}"
+End Function
+
+
+' Plain text only - HTMLBody would ship a wall of markup for the server to dig
+' through, and everything useful (paths, "MATERIAL: ...", quantities) is in the
+' visible text. Capped so a long reply chain can't bloat the request.
+Private Const MAX_BODY_CHARS As Long = 20000
+
+Private Function BodyText(mail As Outlook.MailItem) As String
+    Dim text As String
+    On Error Resume Next
+    text = mail.body
+    On Error GoTo 0
+    If Len(text) > MAX_BODY_CHARS Then text = Left(text, MAX_BODY_CHARS)
+    BodyText = text
+End Function
+
+
+' Deliberately loose: this only decides whether to warn the user, and the
+' server does the real extraction. "W:\jobs\123", "\\server\share" and
+' "C:/x/y" all count.
+Private Function LooksLikeAPath(text As String) As Boolean
+    LooksLikeAPath = (InStr(text, ":\") > 0) Or (InStr(text, ":/") > 0) Or _
+                     (InStr(text, "\\") > 0)
+End Function
+
+
+Private Function ReceivedStamp(mail As Outlook.MailItem) As String
+    On Error Resume Next
+    ReceivedStamp = Format(mail.ReceivedTime, "yyyy-mm-dd hh:nn:ss")
+    On Error GoTo 0
 End Function
 
 

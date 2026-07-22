@@ -160,6 +160,40 @@ def copy_attachments(paths: JobPaths, source_files: list[Path]) -> list[dict[str
     return attachments
 
 
+# Drive-letter or UNC paths in free text. Kept here rather than in the Outlook
+# macro so the rules can change without re-importing and re-signing VBA on
+# every machine - the macro sends the raw body and Python decides.
+# Runs to the end of the line rather than to the first space, because real
+# shop paths contain spaces - "W:\LASER\For Battleshield Fabrication" is one
+# of this shop's own roots. The trailing words are trimmed back below.
+_PATH_IN_TEXT = re.compile(
+    r"(?:[A-Za-z]:[\\/]|\\\\[^\s\\/]+[\\/])[^<>\"'|?*\r\n]*",
+)
+
+
+def paths_in_text(text: str) -> list[str]:
+    """Folder/file paths mentioned in an email body, longest first.
+
+    A path can't be delimited reliably in prose - it may contain spaces and may
+    be followed by more words - so each match yields the full run plus every
+    shorter version of it with trailing words removed. The caller keeps
+    whichever actually exists, which is the only real test.
+    """
+    found: list[str] = []
+    for match in _PATH_IN_TEXT.finditer(str(text or "")):
+        candidate = match.group(0).strip()
+        while candidate and len(candidate) > 3:
+            trimmed = candidate.rstrip(" .,;:)]}>")
+            if trimmed not in found:
+                found.append(trimmed)
+            # Drop the last whitespace-separated word and try again.
+            if " " not in trimmed.strip():
+                break
+            candidate = trimmed.rsplit(" ", 1)[0]
+    # Longest first so a full path wins over the parent folder it contains.
+    return sorted(found, key=len, reverse=True)
+
+
 def create_intake(
     job_number: str,
     label: str | None,
@@ -168,6 +202,7 @@ def create_intake(
     source: str = "manual",
     email_subject: str = "",
     email_sender: str = "",
+    email_body: str = "",
 ) -> dict[str, Any]:
     """Create the job folder, copy attachments in, scrape whatever the PO PDFs
     give up, seed one part row per DXF, and register the intake.
@@ -294,6 +329,18 @@ def create_intake(
         email_subject=email_subject,
         email_sender=email_sender,
     )
+    # Kept whole so later passes (material/qty scraped from the message, or a
+    # W: folder named in it) can re-read it without the email being needed
+    # again. The macro sends it raw precisely so this stays changeable here.
+    entry["email_body"] = email_body
+    # Keep only paths that exist, and drop any that is merely a parent of
+    # another kept one - the candidate list deliberately includes prefixes.
+    existing = [path for path in paths_in_text(email_body) if Path(path).exists()]
+    entry["source_paths"] = [
+        path
+        for path in existing
+        if not any(other != path and other.startswith(path) for other in existing)
+    ]
     entry["job_folder"] = str(paths.intake_dir)
     entry["po_number"] = po_number
     entry["due_date"] = due_date.isoformat() if due_date else None

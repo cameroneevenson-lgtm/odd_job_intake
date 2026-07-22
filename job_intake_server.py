@@ -127,8 +127,6 @@ def _decode_attachments(payload: Any, target_dir: Path) -> list[Path]:
         destination = target_dir / name
         destination.write_bytes(content)
         written.append(destination)
-    if not any(path.name.casefold().endswith(".dxf") for path in written):
-        raise JobIntakeError("No .dxf attachment was sent - there would be nothing to nest.")
     return written
 
 
@@ -248,9 +246,30 @@ def create_app(token: str | None = None, port: int | None = None) -> Flask:
 
         job_number = str(payload.get("job_number", "")).strip().upper()
         label = str(payload.get("label", "") or "").strip()
+        email_body = str(payload.get("email_body", "") or "")
         try:
             with tempfile.TemporaryDirectory(prefix="odd_job_intake_") as staging:
-                files = _decode_attachments(payload.get("attachments"), Path(staging))
+                attachments = payload.get("attachments") or []
+                files = (
+                    _decode_attachments(attachments, Path(staging)) if attachments else []
+                )
+                # A job can arrive as a path to W: with no attachments at all,
+                # so "nothing was attached" is only fatal when the body names
+                # no folder either.
+                if not any(path.name.casefold().endswith(".dxf") for path in files):
+                    if not job_intake_service.paths_in_text(email_body):
+                        return (
+                            jsonify(
+                                {
+                                    "error": (
+                                        "No .dxf attachment and no folder path in the "
+                                        "email body - there is nothing to nest."
+                                    )
+                                }
+                            ),
+                            400,
+                        )
+
                 entry = job_intake_service.create_intake(
                     job_number,
                     label or None,
@@ -258,6 +277,7 @@ def create_app(token: str | None = None, port: int | None = None) -> Flask:
                     source="outlook",
                     email_subject=str(payload.get("email_subject", "") or ""),
                     email_sender=str(payload.get("email_sender", "") or ""),
+                    email_body=email_body,
                 )
         except JobIntakeError as exc:
             return jsonify({"error": str(exc)}), 400
