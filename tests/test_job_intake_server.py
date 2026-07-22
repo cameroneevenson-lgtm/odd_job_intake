@@ -338,6 +338,36 @@ def test_addin_static_refuses_traversal(addin_client) -> None:
     assert response.status_code in (403, 404)
 
 
+def test_template_and_static_paths_do_not_depend_on_sys_modules() -> None:
+    """Regression: master_app embeds this repo by loading its modules and then
+    removing them from sys.modules, so letting Flask infer its root from
+    __name__ resolved to the *host's* directory and every render_template
+    500'd - while importing normally (as these tests do) worked fine. Pin the
+    paths to APP_DIR so both cases agree.
+    """
+    import sys
+
+    from paths import APP_DIR
+
+    app = job_intake_server.create_app(token=TOKEN, port=9999)
+    assert Path(app.root_path) == APP_DIR
+    assert Path(app.template_folder) == APP_DIR / "templates"
+    assert Path(app.static_folder) == APP_DIR / "static"
+
+    # Build one with the module absent from sys.modules, the way the embedded
+    # host leaves things, and confirm it still renders.
+    saved = sys.modules.pop("job_intake_server", None)
+    try:
+        embedded = job_intake_server.create_app(token=TOKEN, port=9999)
+        embedded.config["TESTING"] = True
+        response = embedded.test_client().get("/addin/taskpane")
+        assert response.status_code == 200
+        assert TOKEN in response.get_data(as_text=True)
+    finally:
+        if saved is not None:
+            sys.modules["job_intake_server"] = saved
+
+
 def test_addin_routes_need_no_token(addin_client) -> None:
     """Office fetches these before any add-in code runs and cannot present a
     token; they're safe because they're reachable only over loopback."""

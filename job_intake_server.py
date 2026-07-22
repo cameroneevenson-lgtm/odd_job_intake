@@ -133,7 +133,18 @@ def _decode_attachments(payload: Any, target_dir: Path) -> list[Path]:
 
 
 def create_app(token: str | None = None, port: int | None = None) -> Flask:
-    app = Flask(__name__)
+    # Pin root/template/static paths explicitly instead of letting Flask infer
+    # them from __name__. When master_app embeds this repo it loads the modules
+    # and then removes them from sys.modules, so Flask's inference falls back
+    # to the host's working directory and every render_template 500s - while
+    # importing this module normally (as the tests do) works fine. Deriving
+    # from APP_DIR is correct in both cases.
+    app = Flask(
+        __name__,
+        root_path=str(APP_DIR),
+        template_folder=str(APP_DIR / "templates"),
+        static_folder=str(APP_DIR / "static"),
+    )
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
     expected_token = token if token is not None else ensure_api_token()
     # Baked into the add-in manifest's URLs, so it must be the port actually
