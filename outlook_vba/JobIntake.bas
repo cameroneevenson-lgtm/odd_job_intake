@@ -43,7 +43,7 @@ Public Sub SendToJobIntake()
         Exit Sub
     End If
 
-    baseUrl = BaseUrl()
+    baseUrl = GetBaseUrl()
     token = ReadTextFile(TOKEN_PATH)
     If Len(token) = 0 Then
         MsgBox "Could not read the API token at:" & vbCrLf & TOKEN_PATH & vbCrLf & vbCrLf & _
@@ -133,7 +133,7 @@ Private Function BuildPayload(mail As Outlook.MailItem, jobNumber As String, _
     Dim items As String, name As String
     Dim dxfCount As Long, sentCount As Long
 
-    tempDir = TempDir()
+    tempDir = GetTempDir()
 
     For Each att In mail.Attachments
         name = att.FileName
@@ -208,13 +208,13 @@ Private Function SafeFileName(fileName As String) As String
 End Function
 
 
-Private Function TempDir() As String
+Private Function GetTempDir() As String
     Dim path As String
     Dim fso As Object
     path = Environ$("TEMP") & "\job_intake_vba\"
     Set fso = CreateObject("Scripting.FileSystemObject")
     If Not fso.FolderExists(path) Then fso.CreateFolder path
-    TempDir = path
+    GetTempDir = path
 End Function
 
 
@@ -262,11 +262,11 @@ Private Function HttpCall(method As String, url As String, token As String, _
 End Function
 
 
-Private Function BaseUrl() As String
+Private Function GetBaseUrl() As String
     Dim port As String
     port = Environ$("ODD_JOB_INTAKE_PORT")
     If Len(Trim(port)) = 0 Then port = DEFAULT_PORT
-    BaseUrl = "https://127.0.0.1:" & port
+    GetBaseUrl = "https://127.0.0.1:" & port
 End Function
 
 
