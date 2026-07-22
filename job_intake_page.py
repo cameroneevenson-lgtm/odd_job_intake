@@ -409,12 +409,18 @@ class JobIntakePage(QWidget):
         self.import_button.clicked.connect(self._import_parts)
         self.send_blocks_button = QPushButton("Send Blocks to Machine")
         self.send_blocks_button.clicked.connect(self._send_blocks)
+        self.apply_bom_button = QPushButton("Apply BOM (inventor_to_radan)")
+        self.apply_bom_button.clicked.connect(self._apply_bom)
+        self.full_flow_button = QPushButton("Run Full Flow")
+        self.full_flow_button.clicked.connect(self._run_full_flow)
         self.open_folder_button = QPushButton("Open Job Folder")
         self.open_folder_button.clicked.connect(self._open_job_folder)
         self.open_rpd_button = QPushButton("Open RPD")
         self.open_rpd_button.clicked.connect(self._open_rpd)
         for button in (
             self.save_button,
+            self.apply_bom_button,
+            self.full_flow_button,
             self.create_rpd_button,
             self.import_button,
             self.send_blocks_button,
@@ -770,6 +776,67 @@ class JobIntakePage(QWidget):
         lives in job_intake_service so the 127.0.0.1 listener runs the same
         code path with source="outlook"."""
         return job_intake_service.create_intake(job_number, label or None, files, source="manual")
+
+    def _apply_bom(self) -> None:
+        """Re-run a spreadsheet BOM through inventor_to_radan.
+
+        Intake does this automatically; this is for a BOM that arrived after
+        the job was filed, or a conversion that needed something missing at
+        the time.
+        """
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        try:
+            updated, message = job_intake_service.apply_cam_bom(entry)
+        except JobIntakeError as exc:
+            QMessageBox.warning(self, "Apply BOM", str(exc))
+            return
+
+        if not updated:
+            QMessageBox.information(self, "Apply BOM", message)
+            return
+
+        job_intake_registry.update_entry(
+            str(entry["key"]), material_qty=entry.get("material_qty", [])
+        )
+        self.refresh()
+        self.activity_label.setText(message)
+
+    def _run_full_flow(self) -> None:
+        """Save, create the RPD, then import the parts, stopping on the first
+        problem.
+
+        It deliberately stops before Send Blocks: nesting happens by hand in
+        RADAN between the import and the blocks existing, so there is nothing
+        to send yet.
+        """
+        entry = self._selected_entry()
+        if entry is None:
+            return
+
+        # Check the import gate up front rather than after creating an RPD -
+        # unverified materials and source conflicts are exactly what this
+        # shouldn't steamroll.
+        saved = self._save_details()
+        if saved is None:
+            return
+        try:
+            job_intake_service.build_import_csv_rows(saved)
+        except JobIntakeError as exc:
+            QMessageBox.warning(
+                self,
+                "Run Full Flow",
+                f"Not ready to import yet:\n\n{exc}",
+            )
+            return
+
+        if not Path(str(saved.get("rpd_path") or "")).exists():
+            self._create_rpd()
+            entry = self._selected_entry()
+            if entry is None or not Path(str(entry.get("rpd_path") or "")).exists():
+                return
+        self._import_parts()
 
     def _open_path(self, target: Path, what: str) -> None:
         """Open a folder or file in Explorer / its default app.

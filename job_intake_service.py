@@ -1850,6 +1850,70 @@ def convert_bom_spreadsheet(bom_path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def apply_cam_bom(entry: dict[str, Any]) -> tuple[int, str]:
+    """Re-run the spreadsheet BOM for an existing intake and update its rows.
+
+    Intake already does this automatically, but a BOM is often dropped into
+    the folder after the job was filed, or the conversion needed something
+    that wasn't there yet. Returns (rows updated, message).
+
+    Values it sets are treated exactly like the ones intake produced: still
+    unverified, because a human confirming the material is what teaches the
+    matcher, and CAM output being structured doesn't make it the right job.
+    """
+    attachments = {
+        str(item.get("filename", "")): Path(str(item.get("saved_path", "")))
+        for item in entry.get("attachments", [])
+    }
+    candidates = [
+        path
+        for name, path in attachments.items()
+        if path.suffix.casefold() in BOM_SPREADSHEET_SUFFIXES
+        and not name.casefold().endswith(RADAN_OUTPUT_SUFFIX.casefold())
+        and path.exists()
+        and _looks_like_bom_spreadsheet(path)
+    ]
+    if not candidates:
+        return 0, "No spreadsheet BOM (.csv/.xlsx) is attached to this job."
+
+    rows: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        for row in convert_bom_spreadsheet(candidate):
+            rows[Path(str(row["filename"])).stem.casefold()] = row
+        if rows:
+            break
+    if not rows:
+        return 0, (
+            "inventor_to_radan couldn't convert the BOM - it may need a rule or a "
+            "missing DXF. Run it directly on the file to see what it wants."
+        )
+
+    updated = 0
+    for part in entry.get("material_qty", []):
+        row = rows.get(Path(str(part.get("filename", ""))).stem.casefold())
+        if row is None:
+            continue
+        part["material"] = row["material"]
+        part["thickness"] = row["thickness"]
+        part["qty"] = row["qty"]
+        part["unit"] = row["unit"] or "in"
+        part["strategy"] = row["strategy"] or default_strategy_for_material(row["material"])
+        part["material_source_text"] = "BOM via inventor_to_radan"
+        part["qty_unknown"] = False
+        part["material_confirmed"] = False
+        updated += 1
+
+    unmatched = [
+        str(part.get("filename", ""))
+        for part in entry.get("material_qty", [])
+        if Path(str(part.get("filename", ""))).stem.casefold() not in rows
+    ]
+    message = f"BOM applied to {updated} part(s)."
+    if unmatched:
+        message += " Not in the BOM: " + ", ".join(unmatched)
+    return updated, message
+
+
 # --- BOM parts list ----------------------------------------------------------
 #
 # The best source of all when present, because its DESCRIPTION column holds the
