@@ -697,6 +697,31 @@ def _entry_with_parts(tmp_path: Path) -> dict:
     return entry
 
 
+def test_conflicting_sources_are_a_hard_stop(tmp_path: Path) -> None:
+    """Two sources giving different answers isn't a note to read past. Whoever
+    asked for the job has to say which is right - ranking one source over the
+    other would just be picking a winner silently, and the metal gets cut
+    either way."""
+    entry = _entry_with_parts(tmp_path)
+    part = entry["material_qty"][0]
+    part["material_confirmed"] = False
+    part["source_conflict"] = (
+        "material - the CAM BOM says Mild Steel-A36, the print says Aluminum 5052"
+    )
+
+    with pytest.raises(JobIntakeError) as excinfo:
+        build_import_csv_rows(entry)
+    message = str(excinfo.value)
+    assert "STOP" in message
+    # Both readings are named, so the user knows what to go and ask about.
+    assert "Mild Steel-A36" in message and "Aluminum 5052" in message
+    assert "whoever requested the job" in message
+
+    # A human deciding is the only thing that clears it.
+    part["material_confirmed"] = True
+    assert len(build_import_csv_rows(entry)) == 1
+
+
 def test_build_import_csv_rows_refuses_an_unverified_material(tmp_path: Path) -> None:
     """A predicted material is a guess until someone checks it, and a wrong
     material is expensive - so the import is blocked rather than trusting it."""

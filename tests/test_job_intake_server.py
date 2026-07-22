@@ -114,6 +114,8 @@ def test_submit_creates_folder_and_registry_entry_with_outlook_source(client) ->
             # an answer - a blank qty must never silently become 1.
             "qty_unknown": True,
             "qty_source_text": "",
+            # Only one source spoke, so there is nothing to disagree about.
+            "source_conflict": "",
         }
     ]
 

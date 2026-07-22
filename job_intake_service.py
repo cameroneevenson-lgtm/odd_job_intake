@@ -330,6 +330,20 @@ def create_intake(
     # shop's own description verbatim, so it resolves material/thickness
     # exactly rather than by flattening - and it carries the quantity the
     # prints defer to ("QTY: AS PER BOM").
+    # A spreadsheet BOM outranks everything: it is structured CAM output, and
+    # inventor_to_radan converts it with the shop's own rules rather than
+    # anything guessed here.
+    cam_rows: dict[str, dict[str, Any]] = {}
+    for filename, path in attachment_paths.items():
+        if path.suffix.casefold() not in BOM_SPREADSHEET_SUFFIXES:
+            continue
+        if not _looks_like_bom_spreadsheet(path):
+            continue
+        for row in convert_bom_spreadsheet(path):
+            cam_rows[Path(str(row["filename"])).stem.casefold()] = row
+        if cam_rows:
+            break
+
     bom_rows: dict[str, BomRow] = {}
     available_materials = set(material_choices())
     # Whatever the message itself said, applied to every part in the job -
@@ -410,15 +424,23 @@ def create_intake(
         # Order of trust, most structured first: a BOM states it in the shop's
         # own words; the email was typed for this job but in prose; a print's
         # title block is a drawing note; the DXF's own text is the last resort.
+        cam_row = cam_rows.get(Path(name).stem.casefold())
         material = (
-            bom_material
+            (cam_row["material"] if cam_row else None)
+            or bom_material
             or email_hints.material
             or print_hints.material
             or dxf_hints.material
         )
-        thickness = bom_thickness or print_hints.thickness or dxf_hints.thickness
+        thickness = (
+            (cam_row["thickness"] if cam_row else None)
+            or bom_thickness
+            or print_hints.thickness
+            or dxf_hints.thickness
+        )
         material_source = (
-            (bom_row.description if bom_material else None)
+            (f"BOM via inventor_to_radan" if cam_row else None)
+            or (bom_row.description if bom_material else None)
             or (email_hints.material_source_text if email_hints.material else None)
             or print_hints.material_source_text
             or dxf_hints.material_source_text
@@ -430,15 +452,18 @@ def create_intake(
         # job - and is far more useful surfaced than silently resolved by
         # whichever source happened to rank higher.
         stated = {
+            "the CAM BOM": cam_row["material"] if cam_row else None,
             "the BOM": bom_material,
             "the email": email_hints.material,
             "the print": print_hints.material,
             "the drawing": dxf_hints.material,
         }
         named = {where: value for where, value in stated.items() if value}
+        source_conflict = ""
         if len(set(named.values())) > 1:
             detail = ", ".join(f"{where} says {value}" for where, value in named.items())
-            note = f"{name}: sources disagree on material - {detail}. Using {material}."
+            source_conflict = f"material - {detail}"
+            note = f"{name}: sources disagree on material - {detail}"
             if note not in unmatched:
                 unmatched.append(note)
 
@@ -462,7 +487,8 @@ def create_intake(
         # recorded as unknown rather than defaulting to 1, because silently
         # cutting one of a forty-off part is the expensive failure here.
         resolved_qty = (
-            po_qty
+            (cam_row["qty"] if cam_row else None)
+            or po_qty
             or (bom_row.qty if bom_row is not None else None)
             or email_hints.qty
             or print_hints.qty
@@ -471,6 +497,7 @@ def create_intake(
         qty_unknown = resolved_qty is None
 
         qty_stated = {
+            "the CAM BOM": cam_row["qty"] if cam_row else None,
             "the PO": po_qty,
             "the BOM": bom_row.qty if bom_row is not None else None,
             "the print": print_hints.qty,
@@ -478,7 +505,12 @@ def create_intake(
         qty_named = {where: value for where, value in qty_stated.items() if value}
         if len(set(qty_named.values())) > 1:
             detail = ", ".join(f"{where} says {value}" for where, value in qty_named.items())
-            note = f"{name}: sources disagree on quantity - {detail}. Using {resolved_qty}."
+            source_conflict = (
+                f"{source_conflict}; quantity - {detail}"
+                if source_conflict
+                else f"quantity - {detail}"
+            )
+            note = f"{name}: sources disagree on quantity - {detail}"
             if note not in unmatched:
                 unmatched.append(note)
 
@@ -506,6 +538,11 @@ def create_intake(
                 # placeholder rather than an answer.
                 "qty_unknown": qty_unknown,
                 "qty_source_text": str(print_hints.qty_source_text or ""),
+                # Two sources gave different answers. This is a hard stop, not
+                # a note: it means somebody has to go back to whoever asked for
+                # the job and find out which is right. Ranking one source over
+                # another would just be picking a winner silently.
+                "source_conflict": source_conflict,
             }
         )
 
@@ -1705,6 +1742,114 @@ def extract_print_hints(pdf_path: Path, part_stem: str | None = None) -> PrintHi
     )
 
 
+# --- CSV/XLSX BOM via inventor_to_radan --------------------------------------
+#
+# The top of the hierarchy: a spreadsheet BOM is structured output from CAM,
+# not something to be scraped. inventor_to_radan already turns one into the
+# exact 6-column Radan CSV this feature builds by hand, and owns the rules
+# precedence (ftq_parts.csv overriding description_rules.csv) along with the
+# missing-DXF classification. So it is called, not reimplemented.
+#
+# Its inline_runner.run_inline() is a documented cross-repo contract - the
+# signature and the exceptions it raises are relied on by truck_nest_explorer
+# too - so this only calls it and never reaches past it.
+
+BOM_SPREADSHEET_SUFFIXES = (".csv", ".xlsx")
+RADAN_OUTPUT_SUFFIX = "_Radan.csv"
+
+
+def _load_inventor_to_radan():
+    """The sibling app's inline runner, imported lazily.
+
+    Lazily, and never at module import, so this repo stays usable when
+    inventor_to_radan isn't installed - the same rule explorer_bridge follows
+    for truck_nest_explorer.
+    """
+    import importlib
+    import sys
+
+    root = str(INVENTOR_TO_RADAN_DIR.resolve())
+    if not INVENTOR_TO_RADAN_DIR.exists():
+        raise JobIntakeError(f"inventor_to_radan was not found at {root}")
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return importlib.import_module("inline_runner")
+
+
+def _looks_like_bom_spreadsheet(path: Path) -> bool:
+    """Cheap check that this spreadsheet is a BOM rather than any other CSV.
+
+    inventor_to_radan raises if it can't find a header row, and a job folder
+    can hold unrelated CSVs, so the obvious columns are looked for first.
+    """
+    if path.suffix.casefold() == ".xlsx":
+        return True
+    try:
+        with path.open(newline="", encoding="utf-8-sig", errors="replace") as handle:
+            head = " ".join(next(handle, "") for _ in range(10)).casefold()
+    except OSError:
+        return False
+    return ("qty" in head or "quantity" in head) and (
+        "part" in head or "description" in head
+    )
+
+
+def convert_bom_spreadsheet(bom_path: Path) -> list[dict[str, Any]]:
+    """Hand a spreadsheet BOM to inventor_to_radan and read back its rows.
+
+    Returns [{filename, qty, material, thickness, unit, strategy}], or [] when
+    the conversion couldn't run. Never raises for a BOM that simply doesn't
+    convert - intake continues on the scraped sources instead.
+    """
+    bom_path = Path(bom_path)
+    if not bom_path.exists():
+        return []
+
+    try:
+        runner = _load_inventor_to_radan()
+        runner.run_inline(
+            INVENTOR_TO_RADAN_DIR / "inventor_to_radan.py",
+            bom_path,
+            allow_prompts=False,
+            show_summary=False,
+        )
+    except Exception:
+        # Includes InventorToRadanNeedsUi / Cancelled / ReportRejected, which
+        # are the documented outcomes when it needs a human and can't have one.
+        return []
+
+    output = bom_path.with_name(f"{bom_path.stem}{RADAN_OUTPUT_SUFFIX}")
+    if not output.exists():
+        return []
+
+    rows: list[dict[str, Any]] = []
+    try:
+        with output.open(newline="", encoding="utf-8-sig") as handle:
+            for record in csv.reader(handle):
+                # The agreed headerless shape:
+                # dxf_path, qty, material, thickness, unit, strategy
+                if len(record) < 6:
+                    continue
+                try:
+                    qty = int(str(record[1]).strip())
+                    thickness = float(str(record[3]).strip())
+                except ValueError:
+                    continue
+                rows.append(
+                    {
+                        "filename": Path(str(record[0]).strip()).name,
+                        "qty": qty,
+                        "material": str(record[2]).strip(),
+                        "thickness": thickness,
+                        "unit": str(record[4]).strip() or "in",
+                        "strategy": str(record[5]).strip(),
+                    }
+                )
+    except OSError:
+        return []
+    return rows
+
+
 # --- BOM parts list ----------------------------------------------------------
 #
 # The best source of all when present, because its DESCRIPTION column holds the
@@ -1810,6 +1955,17 @@ def build_import_csv_rows(entry: dict[str, Any]) -> list[list[str]]:
         if not saved_path or not Path(saved_path).exists():
             problems.append(f"{filename}: the copied DXF is missing")
             continue
+        # A disagreement between sources is a hard stop. Whoever asked for the
+        # job has to say which is right - the alternative is cutting metal on
+        # a guess about whose paperwork was newer.
+        conflict = str(part.get("source_conflict", "") or "").strip()
+        if conflict and not part.get("material_confirmed"):
+            problems.append(
+                f"{filename}: STOP - {conflict}. Confirm with whoever requested "
+                f"the job, then set the material and tick Verified"
+            )
+            continue
+
         if not material:
             problems.append(f"{filename}: pick a material")
             continue
