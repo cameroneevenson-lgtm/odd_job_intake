@@ -325,14 +325,12 @@ class RenameJobDialog(QDialog):
         form.addRow("Label", self.label_edit)
         layout.addLayout(form)
 
-        self.include_parts_check = QCheckBox("Also rename the part files (DXF/SYM/PDF)")
-        self.include_parts_check.setChecked(False)
-        layout.addWidget(self.include_parts_check)
-
         note = QLabel(
-            "Part files carry the customer's own numbering, so they are left alone "
-            "by default. The RPD, its nests and the nest summary always move with "
-            "the job, and the references inside them are rewritten."
+            "For fixing the project's name - a typo in the job number, or a "
+            "placeholder becoming a real number. The RPD, its nests and the nest "
+            "summary move with the job and the references inside them are "
+            "rewritten. Part files keep their names: those are the customer's own "
+            "numbering."
         )
         note.setWordWrap(True)
         note.setObjectName("page_subtitle")
@@ -343,11 +341,10 @@ class RenameJobDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def values(self) -> tuple[str, str, bool]:
+    def values(self) -> tuple[str, str]:
         return (
             self.job_number_edit.text().strip().upper(),
             self.label_edit.text().strip(),
-            self.include_parts_check.isChecked(),
         )
 
 
@@ -908,12 +905,10 @@ class JobIntakePage(QWidget):
         )
         if dialog.exec() != QDialog.Accepted:
             return
-        new_number, new_label, include_parts = dialog.values()
+        new_number, new_label = dialog.values()
 
         try:
-            plan = job_intake_service.plan_job_rename(
-                entry, new_number, new_label, include_part_files=include_parts
-            )
+            plan = job_intake_service.plan_job_rename(entry, new_number, new_label)
         except JobIntakeError as exc:
             QMessageBox.warning(self, "Rename Job", str(exc))
             return
@@ -949,14 +944,14 @@ class JobIntakePage(QWidget):
                 / plan.new_project_name
                 / f"{plan.new_project_name}.rpd"
             )
-        if include_parts:
-            for part in entry.get("material_qty", []):
-                part["filename"] = str(part.get("filename", "")).replace(
-                    plan.old_job_number, plan.new_job_number
-                )
-            for attachment in entry.get("attachments", []):
-                attachment["filename"] = str(attachment.get("filename", "")).replace(
-                    plan.old_job_number, plan.new_job_number
+        # Part filenames are untouched by a rename, so the material_qty rows and
+        # the attachment list still point at the right files - only their
+        # saved_path parent moved, which nothing reads by name.
+        for attachment in entry.get("attachments", []):
+            saved = str(attachment.get("saved_path", ""))
+            if saved:
+                attachment["saved_path"] = saved.replace(
+                    str(plan.old_intake_dir), str(plan.new_intake_dir)
                 )
 
         job_intake_registry.delete_entry(old_key)

@@ -750,16 +750,18 @@ class RenamePlan:
 
 
 def plan_job_rename(
-    entry: dict[str, Any],
-    new_job_number: str,
-    new_label: str | None,
-    *,
-    include_part_files: bool = False,
+    entry: dict[str, Any], new_job_number: str, new_label: str | None
 ) -> RenamePlan:
     """Work out everything a rename touches, without changing anything.
 
     Separated from the doing so the user can be shown it first - this moves
     real folders on L: and edits files RADAN depends on.
+
+    Renaming is for fixing the *project's* name - a typo in the job number, or
+    a placeholder becoming a real number. Part files are never touched: their
+    names are the customer's own numbering, they are what the registry rows and
+    the RPD's part list refer to, and no rename of a project should change what
+    a part is called.
     """
     old_number = str(entry.get("job_number", "") or "").strip().upper()
     old_label = entry.get("label")
@@ -790,15 +792,13 @@ def plan_job_rename(
         if path.suffix.casefold() in RENAMEABLE_CONTENT_SUFFIXES:
             rewrites.append(path)
 
-        # Part files are the customer's own numbering, and the registry rows
-        # reference them by name, so they are left alone unless explicitly
-        # asked for. The project's own files - the RPD, its nests, the nest
-        # summary - carry the job number as part of the project's identity and
-        # always move with it.
+        # Part files keep their names, always. Only the project's own files -
+        # the RPD, its nests, the nest summary - carry the job number as part
+        # of the project's identity and move with it.
         is_part_file = path.suffix.casefold() in (".dxf", ".sym") or (
             path.suffix.casefold() == ".pdf" and "NEST" not in path.name.upper()
         )
-        if is_part_file and not include_part_files:
+        if is_part_file:
             continue
 
         # Any file carrying the old project name in its own name, not just
