@@ -221,30 +221,69 @@ def create_intake(
         # jobs emailed without a PO at all.
         dxf_hints = extract_dxf_hints(attachment_paths[name])
 
+        # Third pass: the drawing print sharing this DXF's stem. In practice
+        # this is the richest source - laser DXFs are usually pure geometry
+        # while the print's title block carries MATERIAL, GAUGE and QTY.
+        print_hints = PrintHints(material=None, thickness=None, qty=None)
+        print_path = attachment_paths.get(f"{Path(name).stem}.pdf")
+        if print_path is None:
+            for other, path in attachment_paths.items():
+                if other.casefold().endswith(".pdf") and Path(other).stem.casefold() == Path(name).stem.casefold():
+                    print_path = path
+                    break
+        if print_path is not None:
+            print_hints = extract_print_hints(print_path)
+
+        material = print_hints.material or dxf_hints.material
+        thickness = print_hints.thickness or dxf_hints.thickness
+        material_source = print_hints.material_source_text or dxf_hints.material_source_text
+
+        # A print that names a material/thickness the catalog doesn't list is
+        # worth saying out loud - it usually means the shop's own CSV hasn't
+        # caught up, and silently dropping it looks like the parser failing.
+        if (
+            print_hints.material is not None
+            and print_hints.thickness is None
+            and print_hints.thickness_source_text
+        ):
+            note = (
+                f"{name}: the print asks for {print_hints.thickness_source_text} "
+                f"{print_hints.material}, which isn't in the shop's laser list"
+            )
+            if note not in unmatched:
+                unmatched.append(note)
+
+        # Quantity precedence: the PO is a commitment, the print is a drawing
+        # note. Neither may be invented - a blank QTY or a "REFER TO BOM" is
+        # recorded as unknown rather than defaulting to 1, because silently
+        # cutting one of a forty-off part is the expensive failure here.
+        resolved_qty = po_qty or print_hints.qty or dxf_hints.qty
+        qty_unknown = resolved_qty is None
+
         material_qty.append(
             {
                 "filename": name,
-                "material": dxf_hints.material or "",
-                "thickness": dxf_hints.thickness or 0.0,
-                "qty": int(po_qty or dxf_hints.qty or 1),
+                "material": material or "",
+                "thickness": thickness or 0.0,
+                "qty": int(resolved_qty or 1),
                 "unit": "in",
-                "strategy": (
-                    default_strategy_for_material(dxf_hints.material)
-                    if dxf_hints.material
-                    else ""
-                ),
+                "strategy": default_strategy_for_material(material) if material else "",
                 "po_ref": str(hint.get("raw_description", "") or ""),
                 # Shown as reference so the user can see what the drawing said,
                 # the same way po_ref shows what the PO said.
                 "dxf_ref": " | ".join(dxf_hints.raw_lines),
                 # The customer's own wording for the material, kept beside the
                 # prediction so the translation is visible and checkable.
-                "material_source_text": dxf_hints.material_source_text or "",
+                "material_source_text": material_source or "",
                 # A prediction is never trusted on its own: the user has to
                 # confirm it before parts can be sent to RADAN. Rows with no
                 # prediction start unconfirmed too - picking a material by hand
                 # is itself the confirmation.
                 "material_confirmed": False,
+                # True when nothing stated a quantity, so the 1 above is a
+                # placeholder rather than an answer.
+                "qty_unknown": qty_unknown,
+                "qty_source_text": str(print_hints.qty_source_text or ""),
             }
         )
 
@@ -1195,6 +1234,203 @@ def extract_dxf_hints(dxf_path: Path) -> DXFHints:
         qty=qty,
         raw_lines=contributing,
         material_source_text=material_source_text,
+    )
+
+
+# --- PDF drawing-print title blocks ------------------------------------------
+#
+# The real source of material and thickness for this shop. Verified against
+# F57524's prints: the DXFs exported for laser are pure geometry with no text
+# entities at all, while every print carries MATERIAL and GAUGE in its title
+# block.
+#
+# Read positionally, not by line order. The title block is a table, and its
+# value sits directly *below* its label at the same x - reading the linearised
+# text stream instead gives you a run of labels followed by a run of values,
+# with no way to tell which value belongs to which label, and no way to notice
+# that a label has no value at all.
+
+
+@dataclass(frozen=True)
+class PrintHints:
+    material: str | None
+    thickness: float | None
+    qty: int | None
+    # What the title block literally said, for the user to check against.
+    material_source_text: str | None = None
+    thickness_source_text: str | None = None
+    qty_source_text: str | None = None
+    # True when the print explicitly defers quantity elsewhere ("REFER TO BOM")
+    # or leaves the QTY cell empty. Distinct from "we didn't look" - a blank
+    # quantity must not silently become 1.
+    qty_unknown: bool = False
+
+
+_PRINT_LABELS = {
+    "material": ("material", "matl", "mat'l", "mtl"),
+    "thickness": ("gauge", "gage", "thickness", "thk"),
+    "qty": ("qty", "quantity", "qnty"),
+}
+
+# Values the QTY cell carries when it is deliberately not answering.
+_QTY_DEFERRED = re.compile(r"refer|see|per\b|bom|as\s*req", re.IGNORECASE)
+
+# Measured off the real prints: a value sits ~6-7pt below its label at an
+# *identical* x0 (they share a column), while the next label down is ~18pt
+# away. A max drop of 12 therefore separates "my value" from "the next label"
+# cleanly, which is what lets an empty cell be detected as empty.
+#
+# Note the drop is measured from the label's y0, not its y1: the boxes overlap
+# vertically (MATERIAL ends at 1088.89, its value starts at 1087.88), so
+# testing against y1 rejects the value by a fraction of a point.
+_LABEL_VALUE_MIN_DROP = 3.0
+_LABEL_VALUE_MAX_DROP = 12.0
+_LABEL_VALUE_X_TOLERANCE = 3.0
+# Values wrap to the right along their row; a bigger gap than this is the next
+# column of the title block, not a continuation.
+_LABEL_VALUE_MAX_GAP = 40.0
+
+_ALL_LABEL_WORDS = frozenset(
+    {"title", "size", "scale", "rev", "sheet", "drawn", "checked", "last", "update",
+     "dwg", "no", "date", "tolerances", "unless", "otherwise", "specified"}
+    | {alias for aliases in () for alias in aliases}
+)
+
+
+def _print_words(pdf_path: Path) -> list[list[tuple]]:
+    """Per page, the word boxes (x0, y0, x1, y1, text)."""
+    try:
+        import fitz
+    except ImportError as exc:
+        raise JobIntakeError("PyMuPDF (fitz) is required to read drawing prints.") from exc
+
+    pages: list[list[tuple]] = []
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            for page in doc:
+                pages.append([tuple(word) for word in page.get_text("words")])
+    except Exception:
+        return []
+    return pages
+
+
+def _is_label_word(word: tuple) -> bool:
+    text = str(word[4]).strip().rstrip(":").casefold()
+    if text in _ALL_LABEL_WORDS:
+        return True
+    return any(text in aliases for aliases in _PRINT_LABELS.values())
+
+
+def _value_below_label(words: list[tuple], label_word: tuple) -> str:
+    """The text sitting directly under `label_word`, or "" if the cell is empty.
+
+    Anchored on the shared left edge of the column, because that is the only
+    thing that reliably ties a title-block value to its label.
+    """
+    label_x0, label_y0 = float(label_word[0]), float(label_word[1])
+
+    starts = [
+        word
+        for word in words
+        if abs(float(word[0]) - label_x0) <= _LABEL_VALUE_X_TOLERANCE
+        and _LABEL_VALUE_MIN_DROP <= float(word[1]) - label_y0 <= _LABEL_VALUE_MAX_DROP
+        and not _is_label_word(word)
+    ]
+    if not starts:
+        return ""
+
+    first = min(starts, key=lambda word: float(word[1]))
+    row_y = float(first[1])
+    row = sorted(
+        (
+            word
+            for word in words
+            if abs(float(word[1]) - row_y) <= 3.0 and float(word[0]) >= float(first[0])
+        ),
+        key=lambda word: float(word[0]),
+    )
+
+    # Stop at the first big horizontal gap - that's the next column.
+    parts: list[str] = []
+    previous_x1: float | None = None
+    for word in row:
+        if previous_x1 is not None and float(word[0]) - previous_x1 > _LABEL_VALUE_MAX_GAP:
+            break
+        parts.append(str(word[4]))
+        previous_x1 = float(word[2])
+    return " ".join(parts).strip()
+
+
+def _find_label_values(words: list[tuple]) -> dict[str, str]:
+    """label kind -> the raw text of its cell (may be "" when the cell is empty)."""
+    found: dict[str, str] = {}
+    for word in words:
+        text = str(word[4]).strip().rstrip(":").casefold()
+        for kind, aliases in _PRINT_LABELS.items():
+            if kind in found:
+                continue
+            if text in aliases:
+                found[kind] = _value_below_label(words, word)
+    return found
+
+
+def extract_print_hints(pdf_path: Path) -> PrintHints:
+    """Best-effort material/thickness/qty from a drawing print's title block.
+
+    Degrades to None throughout: a PDF that isn't a print, or a print whose
+    title block doesn't parse, simply contributes nothing.
+    """
+    material = thickness = qty = None
+    material_text = thickness_text = qty_text = None
+    qty_unknown = False
+
+    for words in _print_words(Path(pdf_path)):
+        if not words:
+            continue
+        cells = _find_label_values(words)
+        if not cells:
+            continue
+
+        if material is None and cells.get("material"):
+            material_text = cells["material"]
+            material = _match_material_in_text(material_text)
+
+        if thickness is None and cells.get("thickness"):
+            thickness_text = cells["thickness"]
+            measured = _parse_fraction_or_number(
+                re.sub(r"(?i)\b(?:in|inch|mm|thk|thick)\b|\"", " ", thickness_text).strip()
+            )
+            if measured is None:
+                gauge_match = _GAUGE_PATTERN.search(thickness_text)
+                if gauge_match is not None and material is not None:
+                    measured = _gauge_to_inches(int(gauge_match.group(1)), material)
+            if material is not None:
+                thickness = snap_thickness(measured, material)
+
+        if "qty" in cells and qty is None and not qty_unknown:
+            qty_text = cells["qty"]
+            # An empty QTY cell, or one that defers to a BOM, is *unknown* -
+            # not 1. Silently defaulting is how a 40-off part gets cut once.
+            if not qty_text or _QTY_DEFERRED.search(qty_text):
+                qty_unknown = True
+            else:
+                digits = re.search(r"\b(\d{1,4})\b", qty_text)
+                if digits is not None and int(digits.group(1)) > 0:
+                    qty = int(digits.group(1))
+                else:
+                    qty_unknown = True
+
+        if material is not None and thickness is not None and (qty is not None or qty_unknown):
+            break
+
+    return PrintHints(
+        material=material,
+        thickness=thickness,
+        qty=qty,
+        material_source_text=material_text,
+        thickness_source_text=thickness_text,
+        qty_source_text=qty_text,
+        qty_unknown=qty_unknown,
     )
 
 

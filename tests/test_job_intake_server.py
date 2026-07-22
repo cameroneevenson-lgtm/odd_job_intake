@@ -110,6 +110,10 @@ def test_submit_creates_folder_and_registry_entry_with_outlook_source(client) ->
             # Never pre-confirmed: a material has to be checked by a human
             # before those parts can be imported.
             "material_confirmed": False,
+            # Nothing stated a quantity, so the 1 above is a placeholder, not
+            # an answer - a blank qty must never silently become 1.
+            "qty_unknown": True,
+            "qty_source_text": "",
         }
     ]
 
