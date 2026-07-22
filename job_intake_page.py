@@ -76,7 +76,10 @@ PART_COLUMNS = (
     "Strategy",
     "PO Ref",
     "Drawing Text",
-    "Drawing Says",
+    # Where the material actually came from - a BOM line, a title block, the
+    # email, or the drawing's own text - so "Drawing Says" would be wrong more
+    # often than right now the BOM is the usual source.
+    "Source",
     "Verified",
 )
 
@@ -91,7 +94,17 @@ UNVERIFIED_BACKGROUND = QColor("#FFF4D6")
 # They stay as columns rather than being deleted because the RADAN import CSV
 # is a fixed 6-column format that includes both - build_import_csv_rows reads
 # these cells, so removing them would break the import.
-PART_HIDDEN_COLUMNS = (PART_UNIT_COL, PART_STRATEGY_COL)
+# Unit and Strategy aren't decisions the user makes; PO Ref and Drawing Text
+# were reference columns that the Source column now covers better - PO Ref only
+# ever fills when a real PO PDF is attached, which neither real job had. All
+# four stay in the model: the import CSV needs Unit and Strategy, and the other
+# two are worth keeping for when a job does have them.
+PART_HIDDEN_COLUMNS = (
+    PART_UNIT_COL,
+    PART_STRATEGY_COL,
+    PART_PO_REF_COL,
+    PART_DXF_REF_COL,
+)
 
 POLL_INTERVAL_MS = 4000
 

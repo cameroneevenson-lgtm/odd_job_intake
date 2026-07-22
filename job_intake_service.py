@@ -1226,10 +1226,14 @@ _DXF_THICKNESS_PATTERN = re.compile(
 
 
 def _dxf_text_values(dxf_path: Path) -> list[str]:
-    """Text carried by TEXT/MTEXT entities.
+    """Text carried by TEXT/MTEXT entities in the ENTITIES section.
 
-    DXF is line-pairs of group code then value; codes 1 and 3 hold entity text.
-    Reading the codes directly avoids a CAD dependency for what is a flat scan.
+    DXF is line-pairs of group code then value, and codes 1 and 3 hold entity
+    text. Reading them directly avoids a CAD dependency for what is a flat
+    scan - but they have to be read *in context*: the HEADER section uses the
+    same codes for its own variables, so scanning the whole file returned
+    thousands of values like "AC1018" (the format version) and "ANSI_1252"
+    (the codepage). On a real shop DXF that was 2630 junk strings.
     """
     try:
         raw = dxf_path.read_bytes()[:_DXF_READ_LIMIT]
@@ -1241,19 +1245,45 @@ def _dxf_text_values(dxf_path: Path) -> list[str]:
         # DXFs are commonly cp1252; latin-1 never fails and preserves bytes.
         text = raw.decode("latin-1", errors="replace")
 
-    lines = text.splitlines()
+    lines = [line.strip() for line in text.splitlines()]
     values: list[str] = []
-    for index in range(0, len(lines) - 1):
-        code = lines[index].strip()
-        if code in ("1", "3"):
-            value = lines[index + 1].strip()
+    in_entities = False
+    in_text_entity = False
+
+    for index in range(len(lines) - 1):
+        code, value = lines[index], lines[index + 1]
+
+        if code == "0":
+            if value == "SECTION":
+                in_text_entity = False
+                continue
+            if value == "ENDSEC":
+                in_entities = False
+                in_text_entity = False
+                continue
+            # A new entity ends the previous one; only TEXT-bearing kinds
+            # contribute. ATTRIB/ATTDEF carry title-block values on some
+            # drawings, so they count too.
+            in_text_entity = in_entities and value in (
+                "TEXT",
+                "MTEXT",
+                "ATTRIB",
+                "ATTDEF",
+            )
+            continue
+
+        if code == "2" and not in_entities:
+            in_entities = value == "ENTITIES"
+            continue
+
+        if in_text_entity and code in ("1", "3"):
             # MTEXT carries formatting codes like \pxqc; \fArial|b0; - strip
             # them so the words survive but the markup doesn't.
-            value = re.sub(r"\\[A-Za-z][^;\\]*;?", " ", value)
-            value = re.sub(r"[{}]", " ", value)
-            value = re.sub(r"\s+", " ", value).strip()
-            if value:
-                values.append(value)
+            cleaned = re.sub(r"\\[A-Za-z][^;\\]*;?", " ", value)
+            cleaned = re.sub(r"[{}]", " ", cleaned)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if cleaned:
+                values.append(cleaned)
     return values
 
 
