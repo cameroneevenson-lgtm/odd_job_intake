@@ -199,6 +199,58 @@ def paths_in_text(text: str) -> list[str]:
     return sorted(found, key=len, reverse=True)
 
 
+@dataclass(frozen=True)
+class EmailHints:
+    """Material/qty stated in the message itself.
+
+    Ranks above the prints and below the BOM: someone typed it deliberately
+    for this job, but in prose, with no structure to lean on. Only used when
+    the message names exactly one material, so a signature or a chatty
+    paragraph can't decide anything.
+    """
+
+    material: str | None = None
+    qty: int | None = None
+    material_source_text: str | None = None
+
+
+def extract_email_hints(text: str) -> EmailHints:
+    body = str(text or "")
+    if not body.strip():
+        return EmailHints()
+
+    # Line-by-line, so the phrase that names the material can be quoted back
+    # rather than the whole message.
+    material = source = None
+    ambiguous = False
+    for line in body.splitlines():
+        found = _match_material_in_text(line)
+        if found is None:
+            continue
+        if material is not None and found != material:
+            # The message names two materials - it isn't telling us which.
+            ambiguous = True
+            break
+        material = found
+        source = line.strip()
+    if ambiguous:
+        material = source = None
+
+    qty = None
+    for pattern in (_DXF_QTY_PATTERN, _DXF_QTY_SUFFIX_PATTERN):
+        match = pattern.search(body)
+        if match is not None:
+            try:
+                candidate = int(match.group(1))
+            except ValueError:
+                continue
+            if 0 < candidate <= 9999:
+                qty = candidate
+                break
+
+    return EmailHints(material=material, qty=qty, material_source_text=source)
+
+
 def create_intake(
     job_number: str,
     label: str | None,
@@ -280,6 +332,9 @@ def create_intake(
     # prints defer to ("QTY: AS PER BOM").
     bom_rows: dict[str, BomRow] = {}
     available_materials = set(material_choices())
+    # Whatever the message itself said, applied to every part in the job -
+    # an email names a material for the work, not per drawing.
+    email_hints = extract_email_hints(email_body)
     for filename, path in attachment_paths.items():
         if not filename.casefold().endswith(".pdf"):
             continue
@@ -352,13 +407,40 @@ def create_intake(
                 if note not in unmatched:
                     unmatched.append(note)
 
-        material = bom_material or print_hints.material or dxf_hints.material
+        # Order of trust, most structured first: a BOM states it in the shop's
+        # own words; the email was typed for this job but in prose; a print's
+        # title block is a drawing note; the DXF's own text is the last resort.
+        material = (
+            bom_material
+            or email_hints.material
+            or print_hints.material
+            or dxf_hints.material
+        )
         thickness = bom_thickness or print_hints.thickness or dxf_hints.thickness
         material_source = (
             (bom_row.description if bom_material else None)
+            or (email_hints.material_source_text if email_hints.material else None)
             or print_hints.material_source_text
             or dxf_hints.material_source_text
         )
+
+        # Cross-check: where two sources both named a material, they should
+        # agree. A disagreement is worth a human look - it usually means a
+        # print was superseded by the BOM, or the email is about a different
+        # job - and is far more useful surfaced than silently resolved by
+        # whichever source happened to rank higher.
+        stated = {
+            "the BOM": bom_material,
+            "the email": email_hints.material,
+            "the print": print_hints.material,
+            "the drawing": dxf_hints.material,
+        }
+        named = {where: value for where, value in stated.items() if value}
+        if len(set(named.values())) > 1:
+            detail = ", ".join(f"{where} says {value}" for where, value in named.items())
+            note = f"{name}: sources disagree on material - {detail}. Using {material}."
+            if note not in unmatched:
+                unmatched.append(note)
 
         # A print that names a material/thickness the catalog doesn't list is
         # worth saying out loud - it usually means the shop's own CSV hasn't
@@ -382,10 +464,23 @@ def create_intake(
         resolved_qty = (
             po_qty
             or (bom_row.qty if bom_row is not None else None)
+            or email_hints.qty
             or print_hints.qty
             or dxf_hints.qty
         )
         qty_unknown = resolved_qty is None
+
+        qty_stated = {
+            "the PO": po_qty,
+            "the BOM": bom_row.qty if bom_row is not None else None,
+            "the print": print_hints.qty,
+        }
+        qty_named = {where: value for where, value in qty_stated.items() if value}
+        if len(set(qty_named.values())) > 1:
+            detail = ", ".join(f"{where} says {value}" for where, value in qty_named.items())
+            note = f"{name}: sources disagree on quantity - {detail}. Using {resolved_qty}."
+            if note not in unmatched:
+                unmatched.append(note)
 
         material_qty.append(
             {
