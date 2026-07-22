@@ -776,6 +776,45 @@ def test_a_po_and_a_print_disagreeing_on_material_is_a_hard_stop(
     assert "STOP" in str(excinfo.value)
 
 
+def test_a_placeholder_number_needs_a_label_and_parks_each_job_separately(
+    tmp_path, monkeypatch
+) -> None:
+    """Work often arrives before its number does. A placeholder lets it be
+    filed now, but several unrelated jobs must not pile into one folder while
+    they wait, so each parks under its own label - typically the customer's PO
+    number - and Rename Job moves it once the real number exists.
+    """
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    monkeypatch.setattr(
+        job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
+    )
+    dxf_a = _dxf_with_text(tmp_path / "A.dxf", "GEOMETRY")
+    dxf_b = _dxf_with_text(tmp_path / "B.dxf", "GEOMETRY")
+
+    assert job_intake_service.is_placeholder_job_number("M12345")
+    assert job_intake_service.label_required_for("M12345")
+    # A real number is only constrained once its folder exists.
+    assert not job_intake_service.is_placeholder_job_number("M59919")
+
+    with pytest.raises(JobIntakeError) as excinfo:
+        job_intake_service.create_intake("M12345", None, [dxf_a])
+    assert "placeholder" in str(excinfo.value)
+
+    first = job_intake_service.create_intake("M12345", "PFF PO-8527-001", [dxf_a])
+    second = job_intake_service.create_intake("M12345", "PFF PO-8600-002", [dxf_b])
+
+    assert first["provisional"] is True
+    assert Path(first["job_folder"]).name == "PFF PO-8527-001"
+    assert Path(second["job_folder"]).name == "PFF PO-8600-002"
+    # Same placeholder, different folders - nothing collided.
+    assert first["job_folder"] != second["job_folder"]
+    assert Path(first["job_folder"]).parent == Path(second["job_folder"]).parent
+
+    # The prefix still picks the root, so an M placeholder lands under
+    # M-FABRICATION like any other M job.
+    assert "M-FABRICATION" in first["job_folder"]
+
+
 def test_conflicting_sources_are_a_hard_stop(tmp_path: Path) -> None:
     """Two sources giving different answers isn't a note to read past. Whoever
     asked for the job has to say which is right - ranking one source over the

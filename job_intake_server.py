@@ -233,11 +233,22 @@ def create_app(token: str | None = None, port: int | None = None) -> Flask:
         try:
             job_intake_service.resolve_job_root(job_number)
             exists = job_intake_service.job_folder_exists(job_number)
+            label_required = job_intake_service.label_required_for(job_number)
+            placeholder = job_intake_service.is_placeholder_job_number(job_number)
         except JobIntakeError as exc:
             return jsonify({"error": str(exc)}), 400
-        # Drives whether the task pane shows its Label field: an existing job
-        # folder means this one-off must nest under a label of its own.
-        return jsonify({"job_number": job_number, "exists": exists, "label_required": exists})
+        # Drives whether the caller asks for a Label: an existing job folder
+        # means this one-off must nest under one, and so does a placeholder,
+        # where several jobs would otherwise share a folder while they wait
+        # for their real numbers.
+        return jsonify(
+            {
+                "job_number": job_number,
+                "exists": exists,
+                "label_required": label_required,
+                "placeholder": placeholder,
+            }
+        )
 
     @app.post("/api/job-intake")
     def submit_job_intake() -> tuple[Response, int] | Response:

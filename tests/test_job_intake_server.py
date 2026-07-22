@@ -305,7 +305,21 @@ def test_check_reports_whether_a_label_is_required(client, tmp_path: Path) -> No
         "job_number": "M90005",
         "exists": True,
         "label_required": True,
+        "placeholder": False,
     }
+
+
+def test_check_requires_a_label_for_a_placeholder_number(client) -> None:
+    """A placeholder stands in for a number that hasn't been issued. Several
+    unrelated jobs would otherwise pile into one folder while they wait, so
+    each has to park under its own label."""
+    response = client.get("/api/job-intake/check?job_number=M12345", headers=AUTH)
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["placeholder"] is True
+    assert body["label_required"] is True
+    # Nothing has been filed against it yet - it's required regardless.
+    assert body["exists"] is False
 
 
 def test_check_rejects_an_unknown_prefix(client) -> None:

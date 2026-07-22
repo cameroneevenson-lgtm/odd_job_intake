@@ -257,7 +257,13 @@ class ManualIntakeDialog(QDialog):
             self.hint_label.setText("")
             return
         try:
-            if job_intake_service.job_folder_exists(number):
+            if job_intake_service.is_placeholder_job_number(number):
+                self.hint_label.setText(
+                    f"{number} is a placeholder for a number you don't have yet. "
+                    "Give it a Label to park under - the customer's PO number works "
+                    "well - and use Rename Job once the real number exists."
+                )
+            elif job_intake_service.job_folder_exists(number):
                 self.hint_label.setText(
                     f"{number} already has a folder on L: - a Label is required so this "
                     "one-off gets its own subfolder."
@@ -272,7 +278,12 @@ class ManualIntakeDialog(QDialog):
         label = self.label_edit.text().strip()
         try:
             job_intake_service.resolve_job_root(number)
-            if job_intake_service.job_folder_exists(number) and not label:
+            if job_intake_service.label_required_for(number) and not label:
+                if job_intake_service.is_placeholder_job_number(number):
+                    raise JobIntakeError(
+                        f"{number} is a placeholder - give this job a Label to park "
+                        "under, such as the customer's PO number."
+                    )
                 raise JobIntakeError(
                     f"{number} already exists on L: - give this one-off a Label."
                 )
@@ -599,6 +610,12 @@ class JobIntakePage(QWidget):
             ingested = [str(path) for path in entry.get("ingested_from", []) if str(path).strip()]
             if ingested:
                 notes.append("Files pulled from: " + ", ".join(ingested))
+
+            if entry.get("provisional"):
+                notes.append(
+                    f"{entry.get('job_number')} is a placeholder - use Rename Job "
+                    "once the real number has been issued."
+                )
 
             if notes:
                 self.po_warning_label.setText("Check these:\n- " + "\n- ".join(notes))

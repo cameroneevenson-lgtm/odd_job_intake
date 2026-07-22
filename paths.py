@@ -34,3 +34,15 @@ JOB_PREFIX_TO_ROOT = {
 }
 
 JOB_INTAKE_REGISTRY_PATH = APP_DIR / "_runtime" / "job_intake_registry.json"
+
+# Placeholder numbers for work that arrives before it has been assigned one -
+# "start looking at it, the number comes later". The prefix still picks the
+# root, so an M placeholder lands under M-FABRICATION like any other.
+#
+# One per prefix, and every intake filed against one is *required* to carry a
+# label, so each parks in its own subfolder (M12345\PFF PO-8527-001\) instead
+# of several unrelated jobs piling into the same directory. Rename Job moves
+# it to the real number once that exists.
+PLACEHOLDER_JOB_NUMBERS = frozenset(
+    {f"{prefix}12345" for prefix in JOB_PREFIX_TO_ROOT}
+)

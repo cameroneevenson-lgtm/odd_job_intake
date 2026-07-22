@@ -25,6 +25,7 @@ from paths import (
     INVENTOR_TO_RADAN_DIR,
     JOB_PREFIX_TO_ROOT,
     MACHINE_EIA_BATTLESHIELD_ROOT,
+    PLACEHOLDER_JOB_NUMBERS,
 )
 
 
@@ -101,6 +102,23 @@ def resolve_job_root(job_number: str) -> str:
     return root_name
 
 
+def is_placeholder_job_number(job_number: str) -> bool:
+    """Whether this is a stand-in for a number that hasn't been issued yet."""
+    return str(job_number or "").strip().upper() in PLACEHOLDER_JOB_NUMBERS
+
+
+def label_required_for(job_number: str) -> bool:
+    """Whether an intake for this number must carry a label.
+
+    True when the folder already exists - the long-standing rule that keeps a
+    one-off out of an existing job's directory - and always true for a
+    placeholder, where several unrelated jobs would otherwise pile into the
+    same folder waiting for their real numbers.
+    """
+    number = str(job_number or "").strip().upper()
+    return is_placeholder_job_number(number) or job_folder_exists(number)
+
+
 def job_folder_exists(job_number: str) -> bool:
     number = str(job_number or "").strip().upper()
     root_name = resolve_job_root(number)
@@ -138,6 +156,13 @@ def resolve_job_paths(job_number: str, label: str | None = None) -> JobPaths:
 
 
 def create_job_folders(paths: JobPaths) -> None:
+    if paths.label is None and is_placeholder_job_number(paths.job_number):
+        raise JobIntakeError(
+            f"{paths.job_number} is a placeholder for a number that hasn't been "
+            "issued yet, so it needs a Label to park under - the customer's PO "
+            "number works well (e.g. 'PFF PO-8527-001'). Rename Job once the "
+            "real number exists."
+        )
     if paths.label is None and paths.job_dir.exists():
         raise JobIntakeError(
             f"{paths.job_dir} already exists - give this one-off a Label so it "
@@ -579,6 +604,9 @@ def create_intake(
         entry_rpd_path = ""
         entry_rpd_error = str(exc)
 
+    # Flagged so it's obvious in the queue that this job is still waiting for
+    # its real number, rather than looking like any other filed job.
+    entry["provisional"] = is_placeholder_job_number(job_number)
     entry["ingested_from"] = ingested_from
     entry["source_paths"] = [
         path
