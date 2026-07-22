@@ -14,13 +14,17 @@ import job_intake_registry
 import job_intake_service
 import job_intake_page
 from job_intake_registry import STATUS_RPD_CREATED
+from PySide6.QtCore import Qt
+
 from job_intake_page import (
+    PART_DRAWING_SAYS_COL,
     PART_DXF_COL,
     PART_MATERIAL_COL,
     PART_QTY_COL,
     PART_STRATEGY_COL,
     PART_THICKNESS_COL,
     PART_UNIT_COL,
+    PART_VERIFIED_COL,
     JobIntakePage,
 )
 
@@ -147,6 +151,72 @@ def test_unit_and_strategy_are_hidden_but_still_feed_the_radan_import(qapp, isol
         assert len(rows[0]) == 6
         assert rows[0][4] == "in"
         assert rows[0][5] == "N2"
+    finally:
+        page.deleteLater()
+
+
+def _dxf_with_text(path: Path, *texts: str) -> Path:
+    lines = ["0", "SECTION", "2", "ENTITIES"]
+    for text in texts:
+        lines += ["0", "TEXT", "8", "NOTES", "1", text]
+    lines += ["0", "ENDSEC", "0", "EOF"]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def test_predicted_material_is_shown_with_its_source_and_must_be_verified(
+    qapp, isolated_roots
+) -> None:
+    """The drawing's own wording is shown beside the value it was flattened to,
+    and the prediction stays unverified until a human ticks it."""
+    page = _make_page(qapp)
+    try:
+        page._create_intake(
+            "M50600",
+            "",
+            [_dxf_with_text(isolated_roots / "Rail.DXF", "MATERIAL: ALUMINIUM 5052", "QTY: 3")],
+        )
+        page.refresh()
+        page.queue_table.selectRow(0)
+
+        # Their string is surfaced, next to our canonical translation of it.
+        assert "ALUMINIUM" in page.parts_table.item(0, PART_DRAWING_SAYS_COL).text()
+        assert page.parts_table.item(0, PART_MATERIAL_COL).text() == "Aluminum 5052"
+        # ...but not trusted yet.
+        assert page.parts_table.item(0, PART_VERIFIED_COL).checkState() == Qt.CheckState.Unchecked
+
+        page._save_details()
+        entry = job_intake_registry.get_entry("M50600")
+        assert entry is not None
+        assert entry["material_qty"][0]["material_confirmed"] is False
+
+        # And the import refuses to run on an unverified prediction.
+        with pytest.raises(job_intake_service.JobIntakeError) as excinfo:
+            job_intake_service.build_import_csv_rows(entry)
+        assert "confirm the material" in str(excinfo.value)
+
+        # Ticking Verified is what releases it.
+        page.parts_table.item(0, PART_VERIFIED_COL).setCheckState(Qt.CheckState.Checked)
+        page._save_details()
+        entry = job_intake_registry.get_entry("M50600")
+        assert entry["material_qty"][0]["material_confirmed"] is True
+    finally:
+        page.deleteLater()
+
+
+def test_choosing_a_material_by_hand_counts_as_verifying_it(qapp, isolated_roots) -> None:
+    """The user has just made the decision themselves, so don't then ask them
+    to confirm their own choice."""
+    page = _make_page(qapp)
+    try:
+        page._create_intake("M50601", "", [_dxf(isolated_roots, "Plain.DXF")])
+        page.refresh()
+        page.queue_table.selectRow(0)
+        assert page.parts_table.item(0, PART_VERIFIED_COL).checkState() == Qt.CheckState.Unchecked
+
+        page.parts_table.item(0, PART_MATERIAL_COL).setText("Mild Steel-A36")
+
+        assert page.parts_table.item(0, PART_VERIFIED_COL).checkState() == Qt.CheckState.Checked
     finally:
         page.deleteLater()
 

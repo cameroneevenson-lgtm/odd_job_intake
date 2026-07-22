@@ -1,0 +1,32 @@
+Alias,Material,Note
+aluminum,Aluminum 5052,plain spelling
+aluminium,Aluminum 5052,british spelling seen on customer POs
+alum,Aluminum 5052,common abbreviation
+alu,Aluminum 5052,
+al aly,Aluminum 5052,shop description wording
+5052,Aluminum 5052,grade
+5052 h32,Aluminum 5052,grade + temper
+h32,Aluminum 5052,temper only
+3003,Aluminum 3003 CHK,checker plate grade
+h22,Aluminum 3003 CHK,
+checker plate,Aluminum 3003 CHK,
+checkered plate,Aluminum 3003 CHK,
+chk plate,Aluminum 3003 CHK,
+mild steel,Mild Steel-A36,
+mild stl,Mild Steel-A36,
+ms,Mild Steel-A36,shop abbreviation
+a36,Mild Steel-A36,ASTM grade
+a 36,Mild Steel-A36,spaced variant
+44w,Mild Steel-A36,CSA grade the shop stocks as A36
+crs,Mild Steel-A36,cold rolled steel
+hrs,Mild Steel-A36,hot rolled steel
+cold rolled,Mild Steel-A36,
+hot rolled,Mild Steel-A36,
+carbon steel,Mild Steel-A36,
+stainless,Stainless Steel,
+stainless steel,Stainless Steel,
+ss,Stainless Steel,
+304,Stainless Steel,grade
+304l,Stainless Steel,
+316,Stainless Steel,
+316l,Stainless Steel,

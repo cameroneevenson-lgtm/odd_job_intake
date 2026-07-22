@@ -16,6 +16,7 @@ import time
 from typing import Any
 
 from PySide6.QtCore import QDate, Qt, QTimer
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -63,9 +64,26 @@ PART_UNIT_COL = 4
 PART_STRATEGY_COL = 5
 PART_PO_REF_COL = 6
 PART_DXF_REF_COL = 7
+PART_DRAWING_SAYS_COL = 8
+PART_VERIFIED_COL = 9
 PART_COLUMNS = (
-    "DXF", "Material", "Thickness", "Qty", "Unit", "Strategy", "PO Ref", "Drawing Text",
+    "DXF",
+    "Material",
+    "Thickness",
+    "Qty",
+    "Unit",
+    "Strategy",
+    "PO Ref",
+    "Drawing Text",
+    "Drawing Says",
+    "Verified",
 )
+
+# Every drawing writes material differently ("ALUM", "CRS", "44W"), so the
+# grid shows the customer's own wording next to the canonical value it was
+# flattened to, and makes the user tick Verified before those parts can go to
+# RADAN. Predicting is cheap; a wrong material is not.
+UNVERIFIED_BACKGROUND = QColor("#FFF4D6")
 
 # Kept in the model but hidden from the grid. Neither is a real decision the
 # user makes: Unit is always "in" here, and Strategy is derived from Material.
@@ -528,7 +546,10 @@ class JobIntakePage(QWidget):
                         str(part.get("strategy", "") or ""),
                         str(part.get("po_ref", "") or ""),
                         str(part.get("dxf_ref", "") or ""),
+                        str(part.get("material_source_text", "") or ""),
+                        "",  # Verified: a checkbox, set below
                     )
+                    confirmed = bool(part.get("material_confirmed"))
                     for column, value in enumerate(values):
                         item = QTableWidgetItem(value)
                         if column in (
@@ -536,23 +557,72 @@ class JobIntakePage(QWidget):
                             PART_STRATEGY_COL,
                             PART_PO_REF_COL,
                             PART_DXF_REF_COL,
+                            PART_DRAWING_SAYS_COL,
                         ):
                             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                         # Reference columns can be long; show the full text on
                         # hover rather than widening the grid for them.
-                        if column in (PART_PO_REF_COL, PART_DXF_REF_COL) and value:
+                        if column in (
+                            PART_PO_REF_COL,
+                            PART_DXF_REF_COL,
+                            PART_DRAWING_SAYS_COL,
+                        ) and value:
                             item.setToolTip(value)
+                        if column == PART_VERIFIED_COL:
+                            item.setFlags(
+                                (item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                                & ~Qt.ItemFlag.ItemIsEditable
+                            )
+                            item.setCheckState(
+                                Qt.CheckState.Checked if confirmed else Qt.CheckState.Unchecked
+                            )
+                            item.setToolTip(
+                                "Tick once you've checked the Material matches what "
+                                "the drawing says. Parts can't be imported until this "
+                                "is ticked."
+                            )
                         self.parts_table.setItem(row, column, item)
+                    self._apply_verification_style(row, confirmed)
             finally:
                 self.parts_table.blockSignals(False)
             self.parts_table.resizeColumnsToContents()
         finally:
             self._loading_detail = False
 
+    def _apply_verification_style(self, row: int, confirmed: bool) -> None:
+        """Tint an unverified material so it reads as a suggestion, not a fact."""
+        for column in (PART_MATERIAL_COL, PART_DRAWING_SAYS_COL):
+            cell = self.parts_table.item(row, column)
+            if cell is None:
+                continue
+            has_value = bool(self.parts_table.item(row, PART_MATERIAL_COL).text().strip())
+            if has_value and not confirmed:
+                cell.setBackground(UNVERIFIED_BACKGROUND)
+            else:
+                cell.setData(Qt.ItemDataRole.BackgroundRole, None)
+
     def _on_part_item_changed(self, item: QTableWidgetItem) -> None:
-        if self._loading_detail or item.column() != PART_MATERIAL_COL:
+        if self._loading_detail:
+            return
+
+        if item.column() == PART_VERIFIED_COL:
+            self._apply_verification_style(
+                item.row(), item.checkState() == Qt.CheckState.Checked
+            )
+            return
+
+        if item.column() != PART_MATERIAL_COL:
             return
         material = item.text()
+
+        # Choosing a material by hand *is* the verification - the user has just
+        # made the decision, so don't then ask them to confirm their own choice.
+        verified_item = self.parts_table.item(item.row(), PART_VERIFIED_COL)
+        if verified_item is not None:
+            self.parts_table.blockSignals(True)
+            verified_item.setCheckState(Qt.CheckState.Checked)
+            self.parts_table.blockSignals(False)
+            self._apply_verification_style(item.row(), True)
         strategy_item = self.parts_table.item(item.row(), PART_STRATEGY_COL)
         if strategy_item is not None:
             strategy_item.setText(job_intake_service.default_strategy_for_material(material))
@@ -591,6 +661,7 @@ class JobIntakePage(QWidget):
                 qty = int(_cell(PART_QTY_COL) or 1)
             except ValueError:
                 qty = 1
+            verified_item = self.parts_table.item(row, PART_VERIFIED_COL)
             parts.append(
                 {
                     "filename": _cell(PART_DXF_COL),
@@ -600,6 +671,12 @@ class JobIntakePage(QWidget):
                     "unit": _cell(PART_UNIT_COL) or "in",
                     "strategy": _cell(PART_STRATEGY_COL),
                     "po_ref": _cell(PART_PO_REF_COL),
+                    "dxf_ref": _cell(PART_DXF_REF_COL),
+                    "material_source_text": _cell(PART_DRAWING_SAYS_COL),
+                    "material_confirmed": (
+                        verified_item is not None
+                        and verified_item.checkState() == Qt.CheckState.Checked
+                    ),
                 }
             )
         due_date = (

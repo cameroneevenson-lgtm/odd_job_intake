@@ -106,6 +106,10 @@ def test_submit_creates_folder_and_registry_entry_with_outlook_source(client) ->
             # This DXF is a stub with no TEXT entities, so the drawing-text
             # fallback contributes nothing - the normal case.
             "dxf_ref": "",
+            "material_source_text": "",
+            # Never pre-confirmed: a material has to be checked by a human
+            # before those parts can be imported.
+            "material_confirmed": False,
         }
     ]
 

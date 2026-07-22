@@ -441,9 +441,36 @@ def _entry_with_parts(tmp_path: Path) -> dict:
     entry = new_entry(job_number="M59919")
     entry["attachments"] = [{"filename": "Clip-End.DXF", "saved_path": str(dxf), "size": 3}]
     entry["material_qty"] = [
-        {"filename": "Clip-End.DXF", "material": "Mild Steel-A36", "thickness": 0.25, "unit": "in", "qty": 10, "strategy": ""}
+        {
+            "filename": "Clip-End.DXF",
+            "material": "Mild Steel-A36",
+            "thickness": 0.25,
+            "unit": "in",
+            "qty": 10,
+            "strategy": "",
+            # Materials must be human-confirmed before they can reach RADAN.
+            "material_confirmed": True,
+        }
     ]
     return entry
+
+
+def test_build_import_csv_rows_refuses_an_unverified_material(tmp_path: Path) -> None:
+    """A predicted material is a guess until someone checks it, and a wrong
+    material is expensive - so the import is blocked rather than trusting it."""
+    entry = _entry_with_parts(tmp_path)
+    entry["material_qty"][0]["material_confirmed"] = False
+    entry["material_qty"][0]["material_source_text"] = "MATL: CRS"
+
+    with pytest.raises(JobIntakeError) as excinfo:
+        build_import_csv_rows(entry)
+    message = str(excinfo.value)
+    assert "confirm the material" in message
+    # The customer's own wording is quoted so the user knows what to check.
+    assert "MATL: CRS" in message
+
+    entry["material_qty"][0]["material_confirmed"] = True
+    assert len(build_import_csv_rows(entry)) == 1
 
 
 def test_build_import_csv_rows_happy_path_and_write(tmp_path: Path) -> None:
@@ -460,10 +487,10 @@ def test_build_import_csv_rows_reports_all_problems(tmp_path: Path) -> None:
     entry = _entry_with_parts(tmp_path)
     entry["material_qty"][0]["material"] = ""
     entry["material_qty"].append(
-        {"filename": "Missing.DXF", "material": "Aluminum 5052", "thickness": 0.12, "unit": "in", "qty": 2, "strategy": ""}
+        {"filename": "Missing.DXF", "material": "Aluminum 5052", "thickness": 0.12, "unit": "in", "qty": 2, "strategy": "", "material_confirmed": True}
     )
     entry["material_qty"].append(
-        {"filename": "Clip-End.DXF", "material": "Aluminum 5052", "thickness": 0, "unit": "in", "qty": 2, "strategy": ""}
+        {"filename": "Clip-End.DXF", "material": "Aluminum 5052", "thickness": 0, "unit": "in", "qty": 2, "strategy": "", "material_confirmed": True}
     )
     with pytest.raises(JobIntakeError) as excinfo:
         build_import_csv_rows(entry)

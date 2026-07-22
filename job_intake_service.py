@@ -18,6 +18,7 @@ from typing import Any
 
 import job_intake_registry
 from paths import (
+    APP_DIR,
     BATTLESHIELD_ROOT,
     EXPLORER_TEMPLATE_PATH,
     INVENTOR_TO_RADAN_DIR,
@@ -235,6 +236,14 @@ def create_intake(
                 # Shown as reference so the user can see what the drawing said,
                 # the same way po_ref shows what the PO said.
                 "dxf_ref": " | ".join(dxf_hints.raw_lines),
+                # The customer's own wording for the material, kept beside the
+                # prediction so the translation is visible and checkable.
+                "material_source_text": dxf_hints.material_source_text or "",
+                # A prediction is never trusted on its own: the user has to
+                # confirm it before parts can be sent to RADAN. Rows with no
+                # prediction start unconfirmed too - picking a material by hand
+                # is itself the confirmation.
+                "material_confirmed": False,
             }
         )
 
@@ -574,12 +583,16 @@ def extract_po_hints(pdf_path: Path, dxf_stems: list[str]) -> POHints:
 
 @dataclass(frozen=True)
 class DXFHints:
-    material: str | None       # canonical, only when unambiguous
+    material: str | None       # canonical prediction, only when unambiguous
     thickness: float | None    # only when it exists for that material
     qty: int | None
     # Every line that contributed, for the grid's reference column - so the
     # user can see what the drawing actually said.
     raw_lines: tuple[str, ...] = ()
+    # The customer's own wording that produced `material`. Shown next to the
+    # prediction so the user is verifying a visible translation rather than
+    # trusting an opaque guess.
+    material_source_text: str | None = None
 
 
 # 12MB covers the shop's DXFs comfortably; the cap just stops a pathological
@@ -634,6 +647,38 @@ def _dxf_text_values(dxf_path: Path) -> list[str]:
 _DESCRIPTION_STOPWORDS = frozenset(
     {"plate", "sheet", "thk", "thick", "general", "inch", "steel", "aly"}
 )
+
+MATERIAL_ALIASES_FILENAME = "material_aliases.csv"
+
+
+def _material_aliases_path() -> Path:
+    return APP_DIR / MATERIAL_ALIASES_FILENAME
+
+
+def _read_material_aliases() -> dict[str, str]:
+    """Drawing vocabulary -> the canonical material RADAN expects.
+
+    Every drawing speaks a different dialect - ALUM, ALUMINIUM, AL ALY, 5052,
+    CRS, A-36, 44W - and all of it has to be flattened to the exact string the
+    CAM side accepts. The shop's own description file only covers *its* words,
+    so this table carries the customer wording that file will never contain.
+
+    Edit the CSV to teach it a new dialect; it is read on every call, so new
+    aliases take effect without a restart. An alias pointing at a material the
+    authoritative catalog doesn't list is ignored - that file still decides
+    what exists.
+    """
+    aliases: dict[str, str] = {}
+    try:
+        with _material_aliases_path().open(newline="", encoding="utf-8-sig") as handle:
+            for row in csv.DictReader(handle):
+                alias = _normalize_match_key(row.get("Alias", ""))
+                material = str(row.get("Material", "") or "").strip()
+                if alias and material:
+                    aliases[alias] = material
+    except OSError:
+        return {}
+    return aliases
 
 
 def _material_tokens() -> dict[str, str]:
@@ -690,18 +735,33 @@ def _material_tokens() -> dict[str, str]:
 def _match_material_in_text(text: str) -> str | None:
     """Canonical material for this text, only when exactly one matches.
 
-    Deliberately conservative. The standing rule is that material stays the
-    user's choice because wording is inconsistent; auto-filling is only
-    defensible when the drawing points at exactly one material the shop
-    actually stocks. Anything ambiguous returns None and stays manual.
+    Two layers, both flattening drawing dialect onto the one string the CAM
+    expects: the editable alias table (customer wording), then tokens derived
+    from the shop's own descriptions. Whatever the source, the result must be
+    a material the authoritative catalog lists, or it doesn't exist.
+
+    Deliberately conservative: the standing rule is that material stays the
+    user's choice, so anything ambiguous returns None and stays manual.
     """
-    words = {word.casefold() for word in re.findall(r"[A-Za-z0-9]+", str(text or ""))}
-    if not words:
+    raw = str(text or "")
+    if not raw.strip():
         return None
 
-    matches = {
-        material for token, material in _material_tokens().items() if token in words
-    }
+    available = set(material_choices())
+    matches: set[str] = set()
+
+    # Aliases are matched as normalised phrases so multi-word entries
+    # ("cold rolled", "checker plate") work, not just single tokens.
+    haystack = _normalize_match_key(raw)
+    for alias, material in _read_material_aliases().items():
+        if alias and alias in haystack and material in available:
+            matches.add(material)
+
+    words = {word.casefold() for word in re.findall(r"[A-Za-z0-9]+", raw)}
+    for token, material in _material_tokens().items():
+        if token in words and material in available:
+            matches.add(material)
+
     if len(matches) == 1:
         return matches.pop()
     return None
@@ -739,6 +799,17 @@ def extract_dxf_hints(dxf_path: Path) -> DXFHints:
     joined = " | ".join(values)
     material = _match_material_in_text(joined)
 
+    # Keep the specific line that named the material, not the whole blob, so
+    # the UI can show exactly which of the drawing's words was translated.
+    material_source_text = None
+    if material is not None:
+        for value in values:
+            if _match_material_in_text(value) == material:
+                material_source_text = value
+                break
+        if material_source_text is None:
+            material_source_text = joined
+
     qty: int | None = None
     for pattern in (_DXF_QTY_PATTERN, _DXF_QTY_SUFFIX_PATTERN):
         match = pattern.search(joined)
@@ -770,7 +841,13 @@ def extract_dxf_hints(dxf_path: Path) -> DXFHints:
         or _DXF_THICKNESS_PATTERN.search(value)
         or _match_material_in_text(value) is not None
     )
-    return DXFHints(material=material, thickness=thickness, qty=qty, raw_lines=contributing)
+    return DXFHints(
+        material=material,
+        thickness=thickness,
+        qty=qty,
+        raw_lines=contributing,
+        material_source_text=material_source_text,
+    )
 
 
 # --- RADAN import CSV --------------------------------------------------------
@@ -796,6 +873,18 @@ def build_import_csv_rows(entry: dict[str, Any]) -> list[list[str]]:
             continue
         if not material:
             problems.append(f"{filename}: pick a material")
+            continue
+        # A predicted material must be confirmed by a human before it can
+        # reach RADAN. The translation from the customer's wording is a guess,
+        # and a wrong material is expensive - so verification is enforced here
+        # rather than left to whoever remembers to look.
+        if not part.get("material_confirmed"):
+            source = str(part.get("material_source_text", "") or "").strip()
+            detail = f' (drawing says "{source}")' if source else ""
+            problems.append(
+                f"{filename}: confirm the material{detail} - tick Verified once "
+                f"you've checked {material} is right"
+            )
             continue
         if not isinstance(thickness, (int, float)) or thickness <= 0:
             problems.append(f"{filename}: thickness must be greater than zero")
