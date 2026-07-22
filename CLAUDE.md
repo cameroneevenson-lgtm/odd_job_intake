@@ -145,10 +145,32 @@ Run it alone for debugging with
 `C:\Tools\.venv\Scripts\python.exe job_intake_server.py`, which prints the
 port, the CA path, and the token.
 
+## The Outlook add-in
+
+| Route | Purpose |
+| --- | --- |
+| `GET /addin/manifest.xml` | The sideloadable manifest, **generated** so its URLs always match the live port |
+| `GET /addin/taskpane` | The pane, with the API token injected server-side |
+| `GET /addin/static/<file>` | `taskpane.js`, `taskpane.css`, icons |
+
+- These three are **unauthenticated by necessity** — Office fetches them before
+  any add-in code runs and can't attach a token. Safe because they're
+  loopback-only; the pane is sent `no-store` since it embeds the token.
+- The pane is **same-origin** with the API, so there is no CORS config. Serving
+  it from anywhere else would break that.
+- **Mailbox 1.8 / `ReadItem`**: 1.8 is required by `getAttachmentContentAsync`;
+  `ReadItem` is the minimum it needs and the add-in never writes to the mailbox.
+- **Never hardcode the port into the manifest** — a drifted URL makes Outlook
+  silently refuse to load the add-in. `?host=127.0.0.1` switches loopback
+  spelling; unknown hosts are ignored, not honored.
+- The Office manifest schema is **order-sensitive**; a test pins the top-level
+  element order because getting it wrong fails silently.
+
 ## Status
 
-Phases 1 and 2 are built, tested, and live-verified. **Phase 3 (the Outlook
-task pane) is not built.** The self-signed-cert risk was spiked and is *not* a
-blocker, but it needs the root CA in the Windows trust store and a WebView2
-loopback exemption — see `docs/PLAN.md`, which has the exact command and the
-current state of this machine.
+Phases 1–3 are built and tested; 57 tests pass. **The button is not yet
+installed in Outlook** — that needs the root CA trusted, a WebView2 loopback
+exemption, and a sideload. `docs/PLAN.md` has the exact commands and this
+machine's current state (as of 2026-07-22, neither setup step is done).
+Classic Outlook is the intended target and puts the button on the ribbon; new
+Outlook and OWA show it on the message action bar instead.

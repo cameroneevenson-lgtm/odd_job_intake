@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sideloadable Outlook add-in manifest for the Job Intake task pane.
+
+  Rendered by the listener (GET /addin/manifest.xml) rather than kept as a
+  static file, so every URL below always matches the port the listener is
+  actually bound to. Hand-editing a copy of this and letting the port drift is
+  the easiest way to get an add-in that silently fails to load.
+
+  Requirement set 1.8 is the floor because the pane calls
+  getAttachmentContentAsync, which was introduced there. ReadItem is the
+  minimum permission that API needs - the add-in never writes to the mailbox.
+-->
+<OfficeApp
+  xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+  xmlns:mailappor="http://schemas.microsoft.com/office/mailappversionoverrides"
+  xsi:type="MailApp">
+
+  <!-- Stable: Outlook identifies the installed add-in by this Id. Changing it
+       makes Outlook treat the manifest as an entirely different add-in. -->
+  <Id>670b69b9-8a31-4dd7-83da-0f98e97d4c23</Id>
+  <Version>1.0.0.0</Version>
+  <ProviderName>Battleshield Internal</ProviderName>
+  <DefaultLocale>en-US</DefaultLocale>
+  <DisplayName DefaultValue="Job Intake"/>
+  <Description DefaultValue="Send a one-off job's DXF attachments to the shop's Job Intake queue."/>
+  <IconUrl DefaultValue="{{ base_url }}/addin/static/icon-64.png"/>
+  <HighResolutionIconUrl DefaultValue="{{ base_url }}/addin/static/icon-128.png"/>
+  <SupportUrl DefaultValue="{{ base_url }}/addin/taskpane"/>
+
+  <AppDomains>
+    <AppDomain>{{ base_url }}</AppDomain>
+  </AppDomains>
+
+  <Hosts>
+    <Host Name="Mailbox"/>
+  </Hosts>
+
+  <Requirements>
+    <Sets DefaultMinVersion="1.8">
+      <Set Name="Mailbox"/>
+    </Sets>
+  </Requirements>
+
+  <FormSettings>
+    <Form xsi:type="ItemRead">
+      <DesktopSettings>
+        <SourceLocation DefaultValue="{{ base_url }}/addin/taskpane"/>
+        <RequestedHeight>350</RequestedHeight>
+      </DesktopSettings>
+    </Form>
+  </FormSettings>
+
+  <Permissions>ReadItem</Permissions>
+
+  <Rule xsi:type="RuleCollection" Mode="Or">
+    <Rule xsi:type="ItemIs" ItemType="Message" FormType="Read"/>
+  </Rule>
+  <DisableEntityHighlighting>false</DisableEntityHighlighting>
+
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/mailappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <VersionOverrides xmlns="http://schemas.microsoft.com/office/mailappversionoverrides/1.1" xsi:type="VersionOverridesV1_1">
+      <Requirements>
+        <bt:Sets DefaultMinVersion="1.8">
+          <bt:Set Name="Mailbox"/>
+        </bt:Sets>
+      </Requirements>
+      <Hosts>
+        <Host xsi:type="MailHost">
+          <DesktopFormFactor>
+            <!-- Reading a received message is the only surface this add-in
+                 has any business on: it acts on that message's attachments.
+                 In classic Outlook this puts a button on the ribbon; in new
+                 Outlook and OWA the same entry appears on the message action
+                 bar instead, because those clients don't show add-in
+                 commands on the ribbon. -->
+            <ExtensionPoint xsi:type="MessageReadCommandSurface">
+              <OfficeTab id="TabDefault">
+                <Group id="jobIntakeGroup">
+                  <Label resid="GroupLabel"/>
+                  <Control xsi:type="Button" id="jobIntakeOpenPaneButton">
+                    <Label resid="TaskpaneButton.Label"/>
+                    <Supertip>
+                      <Title resid="TaskpaneButton.Label"/>
+                      <Description resid="TaskpaneButton.Tooltip"/>
+                    </Supertip>
+                    <Icon>
+                      <bt:Image size="16" resid="Icon.16x16"/>
+                      <bt:Image size="32" resid="Icon.32x32"/>
+                      <bt:Image size="80" resid="Icon.80x80"/>
+                    </Icon>
+                    <Action xsi:type="ShowTaskpane">
+                      <SourceLocation resid="Taskpane.Url"/>
+                    </Action>
+                  </Control>
+                </Group>
+              </OfficeTab>
+            </ExtensionPoint>
+          </DesktopFormFactor>
+        </Host>
+      </Hosts>
+      <Resources>
+        <bt:Images>
+          <bt:Image id="Icon.16x16" DefaultValue="{{ base_url }}/addin/static/icon-16.png"/>
+          <bt:Image id="Icon.32x32" DefaultValue="{{ base_url }}/addin/static/icon-32.png"/>
+          <bt:Image id="Icon.80x80" DefaultValue="{{ base_url }}/addin/static/icon-80.png"/>
+        </bt:Images>
+        <bt:Urls>
+          <bt:Url id="Taskpane.Url" DefaultValue="{{ base_url }}/addin/taskpane"/>
+        </bt:Urls>
+        <bt:ShortStrings>
+          <bt:String id="GroupLabel" DefaultValue="Job Intake"/>
+          <bt:String id="TaskpaneButton.Label" DefaultValue="Send to Job Intake"/>
+        </bt:ShortStrings>
+        <bt:LongStrings>
+          <bt:String id="TaskpaneButton.Tooltip" DefaultValue="File this email's DXF attachments against a one-off job number."/>
+        </bt:LongStrings>
+      </Resources>
+    </VersionOverrides>
+  </VersionOverrides>
+</OfficeApp>

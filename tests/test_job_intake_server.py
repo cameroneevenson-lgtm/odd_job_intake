@@ -258,3 +258,88 @@ def test_check_rejects_an_unknown_prefix(client) -> None:
 
 def test_check_needs_a_token(client) -> None:
     assert client.get("/api/job-intake/check?job_number=M90006").status_code == 401
+
+
+# --- the Outlook add-in surface ----------------------------------------------
+
+
+@pytest.fixture
+def addin_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A listener on a known port, so manifest URLs are predictable."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    monkeypatch.setattr(
+        job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
+    )
+    app = job_intake_server.create_app(token=TOKEN, port=9999)
+    app.config["TESTING"] = True
+    return app.test_client()
+
+
+def test_manifest_is_well_formed_and_points_at_the_live_port(addin_client) -> None:
+    """A manifest whose URLs don't match the served port produces an add-in
+    that silently refuses to load, so the port is generated, never hardcoded."""
+    from xml.etree import ElementTree
+
+    response = addin_client.get("/addin/manifest.xml")
+    assert response.status_code == 200
+
+    xml = response.get_data(as_text=True)
+    ElementTree.fromstring(xml)  # raises if the manifest isn't valid XML
+
+    assert "https://localhost:9999/addin/taskpane" in xml
+    assert "https://localhost:9999/addin/static/icon-16.png" in xml
+    assert ":8790" not in xml
+
+
+def test_manifest_can_switch_loopback_spelling(addin_client) -> None:
+    """The cert covers both spellings; ?host= picks which one Office registers."""
+    xml = addin_client.get("/addin/manifest.xml?host=127.0.0.1").get_data(as_text=True)
+    assert "https://127.0.0.1:9999/addin/taskpane" in xml
+    assert "https://localhost:9999" not in xml
+
+
+def test_manifest_ignores_an_unrecognized_host(addin_client) -> None:
+    """?host= must not become a way to point the add-in at an arbitrary origin."""
+    xml = addin_client.get("/addin/manifest.xml?host=evil.example.com").get_data(as_text=True)
+    assert "evil.example.com" not in xml
+    assert "https://localhost:9999/addin/taskpane" in xml
+
+
+def test_manifest_declares_the_requirement_set_the_pane_actually_needs(addin_client) -> None:
+    """getAttachmentContentAsync is Mailbox 1.8; declaring lower would let the
+    add-in install somewhere it then fails at runtime."""
+    xml = addin_client.get("/addin/manifest.xml").get_data(as_text=True)
+    assert 'DefaultMinVersion="1.8"' in xml
+    assert "<Permissions>ReadItem</Permissions>" in xml
+    assert "MessageReadCommandSurface" in xml
+
+
+def test_taskpane_injects_the_token_and_is_not_cached(addin_client) -> None:
+    response = addin_client.get("/addin/taskpane")
+    assert response.status_code == 200
+
+    html = response.get_data(as_text=True)
+    # Injected server-side so it is never hardcoded in the JS or typed by hand.
+    assert TOKEN in html
+    assert "https://localhost:9999" in html
+    # It embeds a credential, so the webview must not persist it.
+    assert "no-store" in response.headers.get("Cache-Control", "")
+
+
+def test_addin_static_files_are_served(addin_client) -> None:
+    for name in ("taskpane.js", "taskpane.css", "icon-16.png", "icon-80.png"):
+        response = addin_client.get(f"/addin/static/{name}")
+        assert response.status_code == 200, name
+        assert response.get_data()
+
+
+def test_addin_static_refuses_traversal(addin_client) -> None:
+    response = addin_client.get("/addin/static/../../paths.py")
+    assert response.status_code in (403, 404)
+
+
+def test_addin_routes_need_no_token(addin_client) -> None:
+    """Office fetches these before any add-in code runs and cannot present a
+    token; they're safe because they're reachable only over loopback."""
+    for path in ("/addin/manifest.xml", "/addin/taskpane", "/addin/static/taskpane.js"):
+        assert addin_client.get(path).status_code == 200, path

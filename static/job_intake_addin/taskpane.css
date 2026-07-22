@@ -1,0 +1,65 @@
+/* Task pane styling. Deliberately plain and self-contained - the pane is a
+   narrow strip inside Outlook, and a webview with no network access to any
+   CDN beyond office.js. Colors match the Ops Suite sidebar. */
+
+:root {
+  --ink: #172033;
+  --muted: #5b6b80;
+  --line: #d5dee8;
+  --accent: #1f6feb;
+  --warn: #8a5a00;
+  --error: #b42318;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 12px 14px 24px;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  color: var(--ink);
+  background: #fff;
+}
+
+h1 { font-size: 17px; margin: 0 0 10px; }
+h2 { font-size: 13px; margin: 18px 0 6px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+
+label { display: block; font-weight: 600; margin-bottom: 4px; }
+
+input[type="text"] {
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font: inherit;
+}
+input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+button {
+  width: 100%;
+  margin-top: 16px;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 5px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:disabled { background: #9fb4cc; cursor: not-allowed; }
+
+.muted { color: var(--muted); }
+.hint { color: var(--muted); font-size: 12px; margin: 5px 0 0; }
+.warn { color: var(--warn); font-weight: 600; margin-bottom: 4px; }
+.error { color: var(--error); font-weight: 600; }
+
+#label-row { margin-top: 14px; }
+
+ul { margin: 6px 0 0; padding-left: 18px; }
+li { margin-bottom: 3px; word-break: break-all; }
+
+dl { margin: 8px 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; }
+dt { color: var(--muted); }
+dd { margin: 0; word-break: break-all; }

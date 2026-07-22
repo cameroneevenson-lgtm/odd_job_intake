@@ -27,7 +27,7 @@ import tempfile
 import threading
 from typing import Any
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, render_template, request, send_from_directory
 
 import job_intake_service
 from job_intake_service import JobIntakeError
@@ -50,6 +50,15 @@ MAX_CONTENT_LENGTH = 64 * 1024 * 1024
 # kept because the PO scrape runs against them. Anything else in the email
 # (images, signatures, .msg) is ignored rather than copied onto L:.
 ALLOWED_SUFFIXES = (".dxf", ".pdf")
+
+ADDIN_STATIC_DIR = APP_DIR / "static" / "job_intake_addin"
+
+# Office resolves the manifest's URLs literally, so the hostname the add-in is
+# registered with has to be one the certificate covers. Both loopback
+# spellings are in the SAN; "localhost" is the default because that is what
+# Office's own tooling and docs use throughout.
+DEFAULT_ADDIN_HOST = "localhost"
+ALLOWED_ADDIN_HOSTS = ("localhost", "127.0.0.1")
 
 
 def listener_port() -> int:
@@ -123,10 +132,13 @@ def _decode_attachments(payload: Any, target_dir: Path) -> list[Path]:
     return written
 
 
-def create_app(token: str | None = None) -> Flask:
+def create_app(token: str | None = None, port: int | None = None) -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
     expected_token = token if token is not None else ensure_api_token()
+    # Baked into the add-in manifest's URLs, so it must be the port actually
+    # served rather than whatever the default happens to be.
+    bind_port = port if port is not None else listener_port()
 
     def _authorized() -> bool:
         header = str(request.headers.get("Authorization", ""))
@@ -151,6 +163,55 @@ def create_app(token: str | None = None) -> Flask:
             mimetype="application/x-x509-ca-cert",
             headers={"Content-Disposition": "attachment; filename=job-intake-root-ca.crt"},
         )
+
+    # --- Outlook add-in (Phase 3) --------------------------------------------
+    # These are unauthenticated because Office fetches them before any add-in
+    # code runs and cannot attach a bearer token. That is safe here: they are
+    # reachable only from this machine over loopback, and the only sensitive
+    # value among them - the API token - is injected into the rendered pane,
+    # which is itself only reachable from this machine.
+
+    def _addin_base_url() -> str:
+        host = str(request.args.get("host", "") or "").strip().casefold()
+        if host not in ALLOWED_ADDIN_HOSTS:
+            host = DEFAULT_ADDIN_HOST
+        return f"https://{host}:{bind_port}"
+
+    @app.get("/addin/manifest.xml")
+    def addin_manifest() -> Response:
+        """The sideloadable manifest, rendered with the live port.
+
+        Generated rather than stored so its URLs can never drift out of sync
+        with the port the listener is actually on - a mismatch shows up in
+        Outlook as an add-in that simply refuses to load. Pass ?host=127.0.0.1
+        to switch loopback spelling; the certificate covers both.
+        """
+        xml = render_template("job_intake_manifest.xml", base_url=_addin_base_url())
+        return Response(
+            xml,
+            mimetype="application/xml",
+            headers={"Content-Disposition": "attachment; filename=job-intake-manifest.xml"},
+        )
+
+    @app.get("/addin/taskpane")
+    def addin_taskpane() -> Response:
+        html = render_template(
+            "job_intake_taskpane.html",
+            base_url=_addin_base_url(),
+            api_token=expected_token,
+        )
+        # The pane embeds the API token, so it must never be cached to disk by
+        # the webview.
+        return Response(
+            html,
+            mimetype="text/html",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+        )
+
+    @app.get("/addin/static/<path:filename>")
+    def addin_static(filename: str) -> Response:
+        # send_from_directory rejects traversal outside the directory itself.
+        return send_from_directory(ADDIN_STATIC_DIR, filename)
 
     @app.get("/api/job-intake/check")
     def check_job_number() -> tuple[Response, int] | Response:
@@ -236,7 +297,7 @@ def serve_tls(port: int | None = None, *, token: str | None = None) -> None:
     the right size for the job.
     """
     bind_port = port if port is not None else listener_port()
-    app = create_app(token)
+    app = create_app(token, port=bind_port)
     app.run(
         host=HOST,
         port=bind_port,

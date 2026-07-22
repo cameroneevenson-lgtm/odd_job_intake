@@ -167,6 +167,39 @@ Sanity check before writing any add-in code: open `https://127.0.0.1:8790/api/he
 
 Because the task pane HTML will be served by this same listener, the pane is same-origin with the API and **no CORS configuration is needed**. Serving it from elsewhere would change that.
 
+## HANDOFF — PHASE 3 CODE COMPLETE, NOT YET INSTALLED IN OUTLOOK
+
+**Built and verified as served; the button is not in Outlook yet** — that needs the sideload plus two machine setup steps below, none of which have been done.
+
+New files: `templates/job_intake_manifest.xml`, `templates/job_intake_taskpane.html`, `static/job_intake_addin/taskpane.js` + `taskpane.css` + `icon-{16,32,64,80,128}.png`. New routes: `GET /addin/manifest.xml`, `GET /addin/taskpane`, `GET /addin/static/<file>`.
+
+**Settled facts:**
+- **The manifest is generated, not stored**, so its URLs always match the port actually served. A manifest whose port has drifted produces an add-in that silently refuses to load. `?host=127.0.0.1` switches loopback spelling (the cert covers both); an unrecognized `?host=` is ignored rather than honored.
+- **Mailbox 1.8 / `ReadItem`** — 1.8 is the floor because the pane calls `getAttachmentContentAsync`; `ReadItem` is the minimum that API needs, and the add-in never writes to the mailbox.
+- **The add-in routes are unauthenticated** because Office fetches them before any add-in code runs and cannot attach a bearer token. Safe here: loopback-only, and the token is injected into the rendered pane, which is itself loopback-only. The pane is sent `no-store` since it embeds a credential.
+- **The pane is same-origin with the API** (both served by this listener), so no CORS configuration exists or is needed. Serving the pane from anywhere else would change that.
+- The pane calls `/api/health` first, so "the shop app isn't running" is reported as exactly that rather than as a failed submit.
+- The Office schema is **order-sensitive**; a test asserts the top-level element order, because getting it wrong is another silent load failure.
+
+**The user prefers classic Outlook, which is the easier target** — both classic (v16.0.20131) and new Outlook (1.2026.602.400) are installed on this machine. In classic the button lands on the ribbon, as configured. In new Outlook and OWA the same `MessageReadCommandSurface` entry appears on the message action bar instead, because those clients don't render add-in commands on the ribbon.
+
+### Remaining steps to actually get the button into Outlook
+
+1. **Trust the root CA.** Confirmed *not* installed (checked `CurrentUser\Root` and `LocalMachine\Root`). Download `https://localhost:8790/job-intake-root-ca.crt` and install to **Trusted Root Certification Authorities**, or:
+   ```
+   Import-Certificate -FilePath "C:\Tools\odd_job_intake\_runtime\certs\odd_job_intake_root_ca.crt.pem" -CertStoreLocation Cert:\CurrentUser\Root
+   ```
+2. **Add the WebView2 loopback exemption** (classic Outlook's webview container). Confirmed *not* registered. Admin PowerShell:
+   ```
+   CheckNetIsolation LoopbackExempt -a -n="microsoft.win32webviewhost_cw5n1h2txyewy"
+   ```
+   If new Outlook is ever used instead, it is a separate appx container and needs its own exemption for `Microsoft.OutlookForWindows_8wekyb3d8bbwe`.
+3. **Check the trust half worked**: open `https://localhost:8790/api/health` in Edge. No cert warning = done.
+4. **Sideload**: with the app running, save `https://localhost:8790/addin/manifest.xml`, then Outlook → Get Add-ins → My add-ins → Add a custom add-in → Add from file. (`https://aka.ms/olksideload` opens the same dialog.)
+5. Open a message with DXF attachments and use **Send to Job Intake**.
+
+Only step 5 is genuinely untested — everything up to it is verified against a real HTTPS socket.
+
 ## Future work — better material/qty extraction when there is no PO
 
 Today extraction only runs against non-DXF PDF attachments, so a job emailed without a PO document falls back to fully manual entry. Worth pursuing, roughly in order of expected payoff:
@@ -176,6 +209,27 @@ Today extraction only runs against non-DXF PDF attachments, so a job emailed wit
 - **Text embedded in the DXF/DWG itself.** TEXT/MTEXT entities and the drawing's own title block frequently name material and thickness. This is the most reliable source of the three when present (it is the designer's own value, not a salesperson's retyping) and the only one available when the DXF arrives with no accompanying document at all. DXF is plain text and parseable directly; DWG would need a converter.
 
 All three feed the same best-effort contract: pre-fill Qty (and possibly show thickness as reference), never auto-fill Material, and surface anything unmatched rather than guessing.
+
+## Future work — the shared Excel workbook as a source of truth to check against
+
+There is an org Excel workbook, shared by link and **edited by several people**, that should be checked against as a source of truth. Not scoped or built yet; the decisions below are the ones to make before writing anything.
+
+**Read it from the local OneDrive sync, not the share link.** This machine already has `C:\Users\<user>\OneDrive - BATTLESHIELD INDUSTRIES LIMITED`, so a synced workbook is just a path on disk — read it with `openpyxl` (already in the shared venv, and `master_app/web_spreadsheet.py` is prior art for reading a workbook in this codebase). That keeps it consistent with how every other shop path here works and needs no auth at all. Downloading the share link directly means either an anonymous-access link (unlikely to be allowed, and it would leak the workbook to anyone with the URL) or Graph API app registration and consent — a lot of machinery, and a token to store, for a file that is already on disk. Prefer the sync path; treat Graph as the fallback only if the workbook turns out not to be synced.
+
+**Treat it as strictly read-only.** It is coauthored live, so this feature must never write to it — a write would race real people's edits and could silently discard them. "Source of truth to check against" means compare and report, never reconcile automatically.
+
+**Concurrency and freshness, which is where this will actually bite:**
+- The file can be locked or mid-save when read (Excel also leaves `~$`-prefixed lock files). Copy to a temp path and read the copy; tolerate a failed read as "no reference data available right now" rather than erroring the intake.
+- OneDrive sync lag means the local copy can be stale. Show the file's mtime next to any comparison result so a mismatch can be attributed to staleness rather than a real discrepancy.
+- Cache the parsed result and re-read on mtime change, not on every UI poll — the page already polls every ~4s.
+
+**Assume the schema drifts.** Several humans editing a sheet over time means renamed, reordered, and inserted columns. Match columns by header name (normalized the same way PO match keys are: punctuation-stripped and casefolded), never by index, and degrade to "couldn't find the columns" instead of silently reading the wrong ones. This is the same lesson the PO parser already learned the hard way.
+
+**Reporting fits the existing pattern:** surface disagreements in the warning banner already used for `po_unmatched`, alongside the PO's own unmatched lines. Consistent with the standing rule that Material stays manual — a mismatch against the workbook is information for the user, never an automatic overwrite of what they entered.
+
+**The workbook has been identified** — it lives on the org's SharePoint tenant, and the user supplied a share link on 2026-07-22. **That link is deliberately not recorded in this repo: this repo is public on GitHub, and the link carries an embedded access token.** It is held outside the tree and should be re-supplied directly when this work starts. The link also arrives wrapped by a mail link-rewriter, which is expected to expire — another reason the local OneDrive sync path above is the better integration point than the URL.
+
+**Open questions to settle first:** which sheet within the workbook; what the key column is that joins a row to a job (job number? PO number?); and which fields are actually authoritative there versus merely present.
 
 ## Verification
 

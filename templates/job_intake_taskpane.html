@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Job Intake</title>
+  <!--
+    Office.js is the one script that must come from Microsoft's CDN - Office
+    requires the hosted copy, it is not redistributable alongside the add-in.
+    Everything else is served from this listener so the pane stays same-origin
+    with the API it posts to (which is why no CORS config is needed).
+  -->
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <link rel="stylesheet" href="/addin/static/taskpane.css">
+</head>
+<body>
+  <main id="pane">
+    <h1>Job Intake</h1>
+
+    <p id="boot" class="muted">Loading…</p>
+
+    <form id="intake-form" hidden>
+      <label for="job-number">Job number</label>
+      <input id="job-number" name="job-number" type="text" placeholder="e.g. M59919"
+             autocomplete="off" spellcheck="false">
+      <p id="job-hint" class="hint"></p>
+
+      <div id="label-row" hidden>
+        <label for="job-label">Label</label>
+        <input id="job-label" name="job-label" type="text" placeholder="e.g. Rework"
+               autocomplete="off">
+        <p class="hint">This job already has a folder, so this one-off needs its own label.</p>
+      </div>
+
+      <h2>Attachments</h2>
+      <p id="attachment-summary" class="muted">Reading the message…</p>
+      <ul id="attachment-list"></ul>
+
+      <button id="submit" type="submit" disabled>Send to Job Intake</button>
+    </form>
+
+    <div id="result" hidden></div>
+    <p id="error" class="error" hidden></p>
+  </main>
+
+  <!--
+    The bearer token is injected here by the server at render time rather than
+    hardcoded in the JS or typed by the user. The pane is only ever served
+    over loopback to this machine, so the token never leaves the PC.
+  -->
+  <script>
+    window.JOB_INTAKE_CONFIG = {
+      token: {{ api_token | tojson }},
+      apiBase: {{ base_url | tojson }}
+    };
+  </script>
+  <script src="/addin/static/taskpane.js"></script>
+</body>
+</html>
