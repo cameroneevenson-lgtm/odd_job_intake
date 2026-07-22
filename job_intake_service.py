@@ -316,14 +316,25 @@ def create_intake(
         # this is the richest source - laser DXFs are usually pure geometry
         # while the print's title block carries MATERIAL, GAUGE and QTY.
         print_hints = PrintHints(material=None, thickness=None, qty=None)
-        print_path = attachment_paths.get(f"{Path(name).stem}.pdf")
-        if print_path is None:
-            for other, path in attachment_paths.items():
-                if other.casefold().endswith(".pdf") and Path(other).stem.casefold() == Path(name).stem.casefold():
-                    print_path = path
-                    break
-        if print_path is not None:
-            print_hints = extract_print_hints(print_path)
+        stem = Path(name).stem
+
+        # Try the identically-named PDF first, then any other PDF, looking for
+        # the page whose title block names this part. A per-part print often
+        # doesn't exist, and a drawing set is routinely one multi-page PDF with
+        # a different part on each page.
+        ordered_pdfs = sorted(
+            (
+                (other, path)
+                for other, path in attachment_paths.items()
+                if other.casefold().endswith(".pdf")
+            ),
+            key=lambda pair: Path(pair[0]).stem.casefold() != stem.casefold(),
+        )
+        for other, path in ordered_pdfs:
+            found = extract_print_hints(path, part_stem=stem)
+            if found.material is not None or found.qty is not None or found.qty_unknown:
+                print_hints = found
+                break
 
         # The BOM wins: its description is the shop's own string, not a
         # customer's wording that had to be interpreted.
@@ -1405,6 +1416,11 @@ _PRINT_LABELS = {
     "material": ("material", "matl", "mat'l", "mtl"),
     "thickness": ("gauge", "gage", "thickness", "thk"),
     "qty": ("qty", "quantity", "qnty"),
+    # Which part this page is for. A drawing set is often one multi-page PDF
+    # with a different part per page, so the page has to identify itself -
+    # matching the file's name to a DXF stem only works when each part happens
+    # to have its own PDF, which is not the norm.
+    "part": ("dwg", "dwgno", "drawing", "drawingno", "partno", "partnumber"),
 }
 
 # Values the QTY cell carries when it is deliberately not answering.
@@ -1421,6 +1437,10 @@ _QTY_DEFERRED = re.compile(r"refer|see|per\b|bom|as\s*req", re.IGNORECASE)
 _LABEL_VALUE_MIN_DROP = 3.0
 _LABEL_VALUE_MAX_DROP = 12.0
 _LABEL_VALUE_X_TOLERANCE = 3.0
+# The drawing-number cell is taller than the stacked MATERIAL/GAUGE ones - its
+# value sits ~15pt below the label rather than ~7 - and nothing else shares
+# that column, so it can afford a wider window without risking the next label.
+_LABEL_VALUE_MAX_DROP_BY_KIND = {"part": 24.0}
 # Values wrap to the right along their row; a bigger gap than this is the next
 # column of the title block, not a continuation.
 _LABEL_VALUE_MAX_GAP = 40.0
@@ -1456,19 +1476,20 @@ def _is_label_word(word: tuple) -> bool:
     return any(text in aliases for aliases in _PRINT_LABELS.values())
 
 
-def _value_below_label(words: list[tuple], label_word: tuple) -> str:
+def _value_below_label(words: list[tuple], label_word: tuple, max_drop: float | None = None) -> str:
     """The text sitting directly under `label_word`, or "" if the cell is empty.
 
     Anchored on the shared left edge of the column, because that is the only
     thing that reliably ties a title-block value to its label.
     """
     label_x0, label_y0 = float(label_word[0]), float(label_word[1])
+    drop_limit = _LABEL_VALUE_MAX_DROP if max_drop is None else max_drop
 
     starts = [
         word
         for word in words
         if abs(float(word[0]) - label_x0) <= _LABEL_VALUE_X_TOLERANCE
-        and _LABEL_VALUE_MIN_DROP <= float(word[1]) - label_y0 <= _LABEL_VALUE_MAX_DROP
+        and _LABEL_VALUE_MIN_DROP <= float(word[1]) - label_y0 <= drop_limit
         and not _is_label_word(word)
     ]
     if not starts:
@@ -1499,18 +1520,30 @@ def _value_below_label(words: list[tuple], label_word: tuple) -> str:
 def _find_label_values(words: list[tuple]) -> dict[str, str]:
     """label kind -> the raw text of its cell (may be "" when the cell is empty)."""
     found: dict[str, str] = {}
-    for word in words:
+    for index, word in enumerate(words):
         text = str(word[4]).strip().rstrip(":").casefold()
+        # "DWG NO" arrives as two words; join with the next one so the label
+        # is recognised either way.
+        joined = text
+        if index + 1 < len(words):
+            joined = f"{text}{str(words[index + 1][4]).strip().rstrip(':').casefold()}"
         for kind, aliases in _PRINT_LABELS.items():
             if kind in found:
                 continue
-            if text in aliases:
-                found[kind] = _value_below_label(words, word)
+            if text in aliases or joined in aliases:
+                found[kind] = _value_below_label(
+                    words, word, _LABEL_VALUE_MAX_DROP_BY_KIND.get(kind)
+                )
     return found
 
 
-def extract_print_hints(pdf_path: Path) -> PrintHints:
+def extract_print_hints(pdf_path: Path, part_stem: str | None = None) -> PrintHints:
     """Best-effort material/thickness/qty from a drawing print's title block.
+
+    When `part_stem` is given, only a page whose title block names that part is
+    used. Drawing sets are routinely one multi-page PDF with a different part
+    per page, so taking the first title block found would attribute page one's
+    material to every DXF in the job.
 
     Degrades to None throughout: a PDF that isn't a print, or a print whose
     title block doesn't parse, simply contributes nothing.
@@ -1518,6 +1551,7 @@ def extract_print_hints(pdf_path: Path) -> PrintHints:
     material = thickness = qty = None
     material_text = thickness_text = qty_text = None
     qty_unknown = False
+    wanted = _normalize_match_key(part_stem or "")
 
     for words in _print_words(Path(pdf_path)):
         if not words:
@@ -1525,6 +1559,13 @@ def extract_print_hints(pdf_path: Path) -> PrintHints:
         cells = _find_label_values(words)
         if not cells:
             continue
+
+        if wanted:
+            stated = _normalize_match_key(cells.get("part", ""))
+            # Accept a containment match: the cell often carries a revision or
+            # sheet suffix the DXF's name doesn't.
+            if not stated or (wanted not in stated and stated not in wanted):
+                continue
 
         if material is None and cells.get("material"):
             material_text = cells["material"]
