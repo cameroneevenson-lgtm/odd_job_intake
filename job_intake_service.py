@@ -875,40 +875,20 @@ def apply_job_rename(plan: RenamePlan) -> str:
 # --- Material list -----------------------------------------------------------
 
 
-EXPECTED_DESCRIPTIONS_FILENAME = "expected_laser_descriptions.csv"
 DESCRIPTION_RULES_FILENAME = "description_rules.csv"
 
 
-# Resolved at call time, not as module-level constants. Binding these at
-# import would freeze the directory (defeating monkeypatching in tests) and,
-# more importantly, is the same class of bug the registry invariant warns
-# about. Everything below re-reads from disk on every call so that materials
-# added to the shop's CSV appear without restarting anything.
-def _expected_descriptions_path() -> Path:
-    return INVENTOR_TO_RADAN_DIR / EXPECTED_DESCRIPTIONS_FILENAME
-
-
+# Resolved at call time, not as a module-level constant. Binding it at import
+# would freeze the directory (defeating monkeypatching in tests) and is the
+# same class of bug the registry invariant warns about. The file is re-read on
+# every call so materials the shop adds appear without restarting anything.
+#
+# expected_laser_descriptions.csv is deliberately not read here at all.
+# inventor_to_radan still uses it for its own missing-DXF classification, but
+# intake does not: it listed a far narrower set than the rules table and gating
+# on it rejected materials that turn up in real customer BOMs.
 def _description_rules_path() -> Path:
     return INVENTOR_TO_RADAN_DIR / DESCRIPTION_RULES_FILENAME
-
-
-def _read_expected_descriptions() -> list[str]:
-    """The shop's authoritative list of laser descriptions.
-
-    If a description isn't in this file it doesn't exist as far as intake is
-    concerned. The file is maintained outside this repo and changes, so it is
-    read on demand rather than cached at import.
-    """
-    descriptions: list[str] = []
-    try:
-        with _expected_descriptions_path().open(newline="", encoding="utf-8-sig") as handle:
-            for row in csv.DictReader(handle):
-                text = str(row.get("Description", "") or "").strip()
-                if text:
-                    descriptions.append(text)
-    except OSError:
-        return []
-    return descriptions
 
 
 def _read_description_rules() -> dict[str, dict[str, Any]]:

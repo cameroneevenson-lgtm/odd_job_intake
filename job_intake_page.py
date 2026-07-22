@@ -126,7 +126,7 @@ def _widen_popup(combo: QComboBox, extra_px: int = 48) -> None:
 
 
 class MaterialComboDelegate(QStyledItemDelegate):
-    """Materials the shop's expected_laser_descriptions.csv allows.
+    """Materials the shop's description_rules.csv lists.
 
     Not editable: that file is authoritative, so a material that isn't in it
     doesn't exist. The list is re-read every time an editor opens, so edits to

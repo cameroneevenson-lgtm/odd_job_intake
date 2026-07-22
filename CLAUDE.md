@@ -91,21 +91,28 @@ Job number already exists (real truck, or a prior one-off) -> Label required:
 `create_job_folders` refuses a fresh intake when the folder already exists and
 tells the user to add a Label — that guard is deliberate.
 
-## `inventor_to_radan`'s CSVs are the truth
+## `inventor_to_radan/description_rules.csv` is the truth
 
-`expected_laser_descriptions.csv` (what exists) and `description_rules.csv`
-(what each description means: material, thickness, strategy) are **the**
-authority. Everything else here is a *route into* them, never a source of
-truth:
+Its **Material / Thickness / Strategy** columns are the authority for what
+exists. Everything else here is a *route into* them, never a source of truth:
 
-- **Nothing may reach the import CSV that didn't come from those files.**
+- **`expected_laser_descriptions.csv` is deliberately not read.** It lists a
+  far narrower set (14 rows against 36) and gating on it rejected materials
+  that turn up in real customer BOMs — 3003 checker plate came through a
+  parts list and was refused. `inventor_to_radan` still uses that file for its
+  own missing-DXF classification; intake does not.
+- **The Description column is not read either** when building the material
+  list. It is a lookup key whose wording varies per customer, and tokenising
+  it harvested "new", "tool" and "mm" as if they named materials. Material
+  vocabulary belongs in `material_aliases.csv`.
+- **Nothing may reach the import CSV that didn't come from that file.**
   `snap_thickness()` only ever returns a value listed in the catalog;
   material matching only returns a member of `material_choices()`;
   `default_strategy_for_material()` reads the rules table. Adding a new way to
   guess is fine — letting a guess through unvalidated is not.
-- **Both are re-read on every call**, never cached at import, and their paths
-  resolve at call time. The shop edits them and new materials must appear
-  without a restart. Binding them as module constants also silently defeats
+- **It is re-read on every call**, never cached at import, and its path
+  resolves at call time. The shop edits it and new materials must appear
+  without a restart. Binding it as a module constant also silently defeats
   monkeypatching — the same trap as the registry path.
 - `material_aliases.csv` (customer wording) and the gauge tables are
   *translation layers only*. An alias pointing at a material the catalog
