@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+import os
 import time
 from typing import Any
 
@@ -408,7 +409,18 @@ class JobIntakePage(QWidget):
         self.import_button.clicked.connect(self._import_parts)
         self.send_blocks_button = QPushButton("Send Blocks to Machine")
         self.send_blocks_button.clicked.connect(self._send_blocks)
-        for button in (self.save_button, self.create_rpd_button, self.import_button, self.send_blocks_button):
+        self.open_folder_button = QPushButton("Open Job Folder")
+        self.open_folder_button.clicked.connect(self._open_job_folder)
+        self.open_rpd_button = QPushButton("Open RPD")
+        self.open_rpd_button.clicked.connect(self._open_rpd)
+        for button in (
+            self.save_button,
+            self.create_rpd_button,
+            self.import_button,
+            self.send_blocks_button,
+            self.open_folder_button,
+            self.open_rpd_button,
+        ):
             actions.addWidget(button)
         actions.addStretch(1)
         detail_layout.addLayout(actions)
@@ -512,11 +524,30 @@ class JobIntakePage(QWidget):
                 summary += f"\nLast error: {entry['error']}"
             self.job_summary_label.setText(summary)
 
-            unmatched = [str(line) for line in entry.get("po_unmatched", []) if str(line).strip()]
-            if unmatched:
-                self.po_warning_label.setText(
-                    "PO lines with no matching DXF attachment:\n- " + "\n- ".join(unmatched)
+            # This banner started life as "PO lines with no matching DXF", but
+            # now also carries BOM and print warnings - a material the shop's
+            # rules don't list, a thickness a print asked for that isn't
+            # stocked - so it's labelled for what it actually holds.
+            notes = [str(line) for line in entry.get("po_unmatched", []) if str(line).strip()]
+
+            unanswered = [
+                str(part.get("filename", ""))
+                for part in entry.get("material_qty", [])
+                if part.get("qty_unknown")
+            ]
+            if unanswered:
+                notes.append(
+                    "Quantity not stated for "
+                    + ", ".join(unanswered)
+                    + " - showing 1 as a placeholder, set the real quantity before importing."
                 )
+
+            ingested = [str(path) for path in entry.get("ingested_from", []) if str(path).strip()]
+            if ingested:
+                notes.append("Files pulled from: " + ", ".join(ingested))
+
+            if notes:
+                self.po_warning_label.setText("Check these:\n- " + "\n- ".join(notes))
                 self.po_warning_label.setVisible(True)
             else:
                 self.po_warning_label.setVisible(False)
@@ -550,6 +581,7 @@ class JobIntakePage(QWidget):
                         "",  # Verified: a checkbox, set below
                     )
                     confirmed = bool(part.get("material_confirmed"))
+                    qty_unknown = bool(part.get("qty_unknown"))
                     for column, value in enumerate(values):
                         item = QTableWidgetItem(value)
                         if column in (
@@ -580,6 +612,17 @@ class JobIntakePage(QWidget):
                                 "Tick once you've checked the Material matches what "
                                 "the drawing says. Parts can't be imported until this "
                                 "is ticked."
+                            )
+                        # Nothing stated a quantity, so this 1 is a placeholder.
+                        # Tint it: an unanswered 1 is indistinguishable from a
+                        # real one, and cutting a single part of a forty-off
+                        # order is the expensive mistake here.
+                        if column == PART_QTY_COL and qty_unknown:
+                            item.setBackground(UNVERIFIED_BACKGROUND)
+                            source = str(part.get("qty_source_text", "") or "").strip()
+                            item.setToolTip(
+                                f'No quantity was stated{f" - the print says {source!r}" if source else ""}. '
+                                "This is a placeholder; set the real quantity."
                             )
                         self.parts_table.setItem(row, column, item)
                     self._apply_verification_style(row, confirmed)
@@ -727,6 +770,51 @@ class JobIntakePage(QWidget):
         lives in job_intake_service so the 127.0.0.1 listener runs the same
         code path with source="outlook"."""
         return job_intake_service.create_intake(job_number, label or None, files, source="manual")
+
+    def _open_path(self, target: Path, what: str) -> None:
+        """Open a folder or file in Explorer / its default app.
+
+        os.startfile rather than the explorer bridge: this is a plain shell
+        open with no RADAN involvement, and it shouldn't need the sibling app
+        to be loadable just to look at a folder.
+        """
+        if not target.exists():
+            QMessageBox.warning(
+                self, what, f"{what} isn't there yet:\n{target}"
+            )
+            return
+        try:
+            os.startfile(str(target))  # noqa: S606 - Windows shell open
+        except OSError as exc:
+            QMessageBox.warning(self, what, f"Could not open {target}:\n{exc}")
+
+    def _open_job_folder(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        folder = str(entry.get("job_folder") or "")
+        if not folder:
+            QMessageBox.warning(self, "Open Job Folder", "This intake has no job folder yet.")
+            return
+        self._open_path(Path(folder), "Open Job Folder")
+
+    def _open_rpd(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        rpd = str(entry.get("rpd_path") or "")
+        if not rpd:
+            # Fall back to where it would be, so the button is still useful
+            # before Create Blank RPD has been pressed.
+            try:
+                paths = job_intake_service.resolve_job_paths(
+                    str(entry.get("job_number", "")), entry.get("label")
+                )
+                rpd = str(paths.rpd_path)
+            except JobIntakeError:
+                QMessageBox.warning(self, "Open RPD", "This intake has no RPD yet.")
+                return
+        self._open_path(Path(rpd), "Open RPD")
 
     def _save_details(self) -> dict[str, Any] | None:
         entry = self._selected_entry()
