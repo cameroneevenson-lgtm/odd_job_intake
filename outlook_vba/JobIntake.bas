@@ -20,9 +20,21 @@ Option Explicit
 Private Const DEFAULT_PORT As String = "8790"
 Private Const TOKEN_PATH As String = "C:\Tools\odd_job_intake\_runtime\job_intake_api_token.key"
 
-' Only these are sent. DXFs are the work; PDFs are kept because the PO scrape
-' runs against them. The server enforces this too - this is just early feedback.
-Private Const ALLOWED_EXTENSIONS As String = ".dxf|.pdf"
+' Only these are sent. DXFs are the work; PDFs are kept because the PO and
+' drawing-print scrapes run against them; .csv/.xlsx because a BOM can arrive
+' attached rather than at a W: path, and inventor_to_radan accepts exactly
+' those two. Anything else (images, signatures, .msg) is left behind rather
+' than copied onto L:. The server enforces this too - this is early feedback.
+Private Const ALLOWED_EXTENSIONS As String = ".dxf|.pdf|.csv|.xlsx"
+
+' Plain text only - HTMLBody would ship a wall of markup for the server to dig
+' through, and everything useful (paths, "MATERIAL: ...", quantities) is in the
+' visible text. Capped so a long reply chain can't bloat the request.
+'
+' VBA requires every module-level declaration to sit here in the declarations
+' section, above the first procedure - a Const between two functions is the
+' "Only comments may appear after End Sub/End Function" compile error.
+Private Const MAX_BODY_CHARS As Long = 20000
 
 
 ' ===== entry point =========================================================
@@ -183,11 +195,6 @@ Private Function BuildPayload(mail As Outlook.MailItem, jobNumber As String, _
                    """attachments"":[" & items & "]}"
 End Function
 
-
-' Plain text only - HTMLBody would ship a wall of markup for the server to dig
-' through, and everything useful (paths, "MATERIAL: ...", quantities) is in the
-' visible text. Capped so a long reply chain can't bloat the request.
-Private Const MAX_BODY_CHARS As Long = 20000
 
 Private Function BodyText(mail As Outlook.MailItem) As String
     Dim text As String

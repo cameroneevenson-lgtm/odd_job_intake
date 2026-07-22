@@ -47,9 +47,12 @@ TOKEN_PATH = APP_DIR / "_runtime" / "job_intake_api_token.key"
 MAX_CONTENT_LENGTH = 64 * 1024 * 1024
 
 # Only these are accepted off the wire. DXFs are the actual work; PDFs are
-# kept because the PO scrape runs against them. Anything else in the email
-# (images, signatures, .msg) is ignored rather than copied onto L:.
-ALLOWED_SUFFIXES = (".dxf", ".pdf")
+# kept because the PO and drawing-print scrapes run against them; .csv/.xlsx
+# because a BOM can arrive attached rather than at a W: path, and those are
+# exactly the two extensions inventor_to_radan accepts
+# (config.SUPPORTED_BOM_EXTENSIONS). Anything else in the email (images,
+# signatures, .msg) is ignored rather than copied onto L:.
+ALLOWED_SUFFIXES = (".dxf", ".pdf", ".csv", ".xlsx")
 
 ADDIN_STATIC_DIR = APP_DIR / "static" / "job_intake_addin"
 
