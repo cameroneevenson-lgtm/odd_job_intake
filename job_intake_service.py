@@ -46,6 +46,11 @@ MATERIAL_DEFAULT_STRATEGY = {
 
 UNIT_CHOICES = ("in", "mm", "swg")
 
+# What gets pulled in when an email points at a folder instead of attaching
+# files. Mirrors the attachment allow-list: geometry, the prints and BOM the
+# scrapes read, and a spreadsheet BOM that inventor_to_radan can consume.
+INGESTED_SUFFIXES = (".dxf", ".pdf", ".csv", ".xlsx")
+
 # Every sampled PFF PO number is 4 digits, dash, 3 digits, optionally prefixed
 # (PO-, Q-) and/or revision-suffixed (-R1).
 PO_NUMBER_PATTERN = re.compile(r"(?:PO-|Q-)?\d{4}-\d{3}(?:-R\d+)?")
@@ -215,7 +220,30 @@ def create_intake(
     """
     paths = resolve_job_paths(job_number, label or None)
     create_job_folders(paths)
-    attachments = copy_attachments(paths, list(files))
+
+    # Some jobs arrive as a path on W: instead of attachments - "please
+    # manufacture the parts at the following path". Pull the work files in so
+    # everything downstream sees one job folder, exactly as if they had been
+    # attached.
+    collected = list(files)
+    ingested_from: list[str] = []
+    for candidate in paths_in_text(email_body):
+        folder = Path(candidate)
+        if not folder.is_dir():
+            continue
+        pulled = [
+            item
+            for item in sorted(folder.iterdir())
+            if item.is_file() and item.suffix.casefold() in INGESTED_SUFFIXES
+        ]
+        if pulled:
+            collected.extend(pulled)
+            ingested_from.append(str(folder))
+        # Only the first folder that actually holds work files; the candidate
+        # list contains parent paths of it too.
+        break
+
+    attachments = copy_attachments(paths, collected)
 
     dxf_names = [
         attachment["filename"]
@@ -246,6 +274,34 @@ def create_intake(
         for attachment in attachments
     }
 
+    # A parts list, if one came with the job. Its DESCRIPTION column is the
+    # shop's own description verbatim, so it resolves material/thickness
+    # exactly rather than by flattening - and it carries the quantity the
+    # prints defer to ("QTY: AS PER BOM").
+    bom_rows: dict[str, BomRow] = {}
+    available_materials = set(material_choices())
+    for filename, path in attachment_paths.items():
+        if not filename.casefold().endswith(".pdf"):
+            continue
+        found = extract_bom_rows(path, [Path(name).stem for name in dxf_names])
+        if found:
+            bom_rows = found
+            break
+
+    # The PO scrape ran over the BOM and the prints too, reporting their rows
+    # as "unmatched PO lines". Those lines were understood, just by a different
+    # reader, so drop them before any real warnings are added below - filtering
+    # afterwards would also strip warnings that legitimately mention the BOM.
+    if bom_rows:
+        accounted = {_normalize_match_key(row.description) for row in bom_rows.values()}
+        accounted.update(_normalize_match_key(row.part) for row in bom_rows.values())
+        unmatched = [
+            line
+            for line in unmatched
+            if _normalize_match_key(line) not in accounted
+            and not _QTY_DEFERRED.search(line)
+        ]
+
     material_qty = []
     for name in dxf_names:
         hint = line_items.get(Path(name).stem, {})
@@ -269,9 +325,29 @@ def create_intake(
         if print_path is not None:
             print_hints = extract_print_hints(print_path)
 
-        material = print_hints.material or dxf_hints.material
-        thickness = print_hints.thickness or dxf_hints.thickness
-        material_source = print_hints.material_source_text or dxf_hints.material_source_text
+        # The BOM wins: its description is the shop's own string, not a
+        # customer's wording that had to be interpreted.
+        bom_row = bom_rows.get(Path(name).stem)
+        bom_material = bom_thickness = None
+        if bom_row is not None and bom_row.material:
+            if bom_row.material in available_materials:
+                bom_material = bom_row.material
+                bom_thickness = bom_row.thickness
+            else:
+                note = (
+                    f"{name}: the BOM asks for {bom_row.material} "
+                    f'("{bom_row.description}"), which isn\'t in the shop\'s laser list'
+                )
+                if note not in unmatched:
+                    unmatched.append(note)
+
+        material = bom_material or print_hints.material or dxf_hints.material
+        thickness = bom_thickness or print_hints.thickness or dxf_hints.thickness
+        material_source = (
+            (bom_row.description if bom_material else None)
+            or print_hints.material_source_text
+            or dxf_hints.material_source_text
+        )
 
         # A print that names a material/thickness the catalog doesn't list is
         # worth saying out loud - it usually means the shop's own CSV hasn't
@@ -292,7 +368,12 @@ def create_intake(
         # note. Neither may be invented - a blank QTY or a "REFER TO BOM" is
         # recorded as unknown rather than defaulting to 1, because silently
         # cutting one of a forty-off part is the expensive failure here.
-        resolved_qty = po_qty or print_hints.qty or dxf_hints.qty
+        resolved_qty = (
+            po_qty
+            or (bom_row.qty if bom_row is not None else None)
+            or print_hints.qty
+            or dxf_hints.qty
+        )
         qty_unknown = resolved_qty is None
 
         material_qty.append(
@@ -336,6 +417,7 @@ def create_intake(
     # Keep only paths that exist, and drop any that is merely a parent of
     # another kept one - the candidate list deliberately includes prefixes.
     existing = [path for path in paths_in_text(email_body) if Path(path).exists()]
+    entry["ingested_from"] = ingested_from
     entry["source_paths"] = [
         path
         for path in existing
@@ -1479,6 +1561,90 @@ def extract_print_hints(pdf_path: Path) -> PrintHints:
         qty_source_text=qty_text,
         qty_unknown=qty_unknown,
     )
+
+
+# --- BOM parts list ----------------------------------------------------------
+#
+# The best source of all when present, because its DESCRIPTION column holds the
+# shop's own description string verbatim - "PLATE, AL ALY, .188" THK, 5052 H32
+# GENERAL" is a line in expected_laser_descriptions.csv, not a customer's
+# paraphrase. That resolves material, thickness and strategy exactly, with no
+# flattening or guesswork, and it carries the quantity the prints defer to
+# ("QTY: AS PER BOM").
+
+
+@dataclass(frozen=True)
+class BomRow:
+    part: str
+    description: str
+    qty: int | None
+    material: str | None
+    thickness: float | None
+
+
+def _looks_like_bom(lines: list[str]) -> bool:
+    joined = " ".join(lines[:40]).casefold()
+    return "parts list" in joined or ("part number" in joined and "qty" in joined)
+
+
+def extract_bom_rows(pdf_path: Path, part_stems: list[str]) -> dict[str, BomRow]:
+    """part stem -> its BOM row, for the parts actually present.
+
+    Anchored on the stems we hold rather than on the table's shape: the parts
+    list linearises one cell per line like every other PDF table here, and the
+    column order varies between templates. Finding the part number - a value we
+    already know - and reading its neighbours is stable across both.
+    """
+    try:
+        import fitz
+    except ImportError as exc:
+        raise JobIntakeError("PyMuPDF (fitz) is required to read a BOM.") from exc
+
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            text = "\n".join(str(page.get_text("text") or "") for page in doc)
+    except Exception:
+        return {}
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not _looks_like_bom(lines):
+        return {}
+
+    wanted = {_normalize_match_key(stem): stem for stem in part_stems if stem}
+    rules = _read_description_rules()
+    rows: dict[str, BomRow] = {}
+
+    for index, line in enumerate(lines):
+        stem = wanted.get(_normalize_match_key(line))
+        if stem is None or stem in rows:
+            continue
+
+        # The description sits immediately before the part number, and the
+        # quantity immediately after it.
+        description = lines[index - 1] if index >= 1 else ""
+        qty: int | None = None
+        if index + 1 < len(lines) and lines[index + 1].isdigit():
+            candidate = int(lines[index + 1])
+            if 0 < candidate <= 9999:
+                qty = candidate
+
+        material = thickness = None
+        rule = rules.get(_normalize_match_key(description))
+        if rule is not None:
+            material = str(rule["material"])
+            thickness = float(rule["thickness"])
+        else:
+            # Not a verbatim description - fall back to the usual flattening.
+            material = _match_material_in_text(description)
+
+        rows[stem] = BomRow(
+            part=stem,
+            description=description,
+            qty=qty,
+            material=material,
+            thickness=thickness,
+        )
+    return rows
 
 
 # --- RADAN import CSV --------------------------------------------------------
