@@ -776,6 +776,38 @@ def test_a_po_and_a_print_disagreeing_on_material_is_a_hard_stop(
     assert "STOP" in str(excinfo.value)
 
 
+def test_files_already_on_the_shared_drive_are_referenced_not_copied(
+    tmp_path, monkeypatch, shop_csvs
+) -> None:
+    """W: is the source of truth for a job filed by path. Copying it to L: only
+    created a second version to drift out of date, and was by far the slowest
+    part of an intake - a real 28-file job spent 53s on it, past the timeout of
+    whatever was waiting."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    monkeypatch.setattr(
+        job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
+    )
+    shared = tmp_path / "W" / "Job 123"
+    shared.mkdir(parents=True)
+    _dxf_with_text(shared / "Panel.dxf", "GEOMETRY")
+    (shared / "Panel.pdf").write_bytes(b"%PDF-1.4\n")
+
+    entry = job_intake_service.create_intake(
+        "M50950", None, [], source="outlook", email_body=f"parts at {shared} thanks"
+    )
+
+    attachments = {a["filename"]: a for a in entry["attachments"]}
+    assert attachments["Panel.dxf"]["in_place"] is True
+    # The row points into the shared folder, not a copy under L:.
+    assert Path(attachments["Panel.dxf"]["saved_path"]).parent == shared
+
+    job_folder = Path(entry["job_folder"])
+    assert not (job_folder / "Panel.dxf").exists(), "the DXF was copied after all"
+
+    # The shared folder is left exactly as it was found.
+    assert sorted(p.name for p in shared.iterdir()) == ["Panel.dxf", "Panel.pdf"]
+
+
 def test_a_placeholder_number_needs_a_label_and_parks_each_job_separately(
     tmp_path, monkeypatch
 ) -> None:

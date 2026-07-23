@@ -174,6 +174,33 @@ def create_job_folders(paths: JobPaths) -> None:
         folder.mkdir(parents=True, exist_ok=True)
 
 
+def reference_files(source_files: list[Path]) -> list[dict[str, Any]]:
+    """Record files without copying them.
+
+    Used for work already sitting on W:. That folder is the source of truth for
+    the job, so a copy on L: would only be a second version to drift out of
+    date - and copying it was by far the slowest part of an intake. The
+    trade-off, accepted deliberately: if engineering renames or removes
+    something afterwards, these paths go stale.
+    """
+    referenced: list[dict[str, Any]] = []
+    for source in source_files:
+        source = Path(source)
+        if not source.exists():
+            continue
+        referenced.append(
+            {
+                "filename": source.name,
+                "saved_path": str(source),
+                "size": source.stat().st_size,
+                # So the UI and any later check can tell a referenced file from
+                # one that was copied into the job folder.
+                "in_place": True,
+            }
+        )
+    return referenced
+
+
 def copy_attachments(paths: JobPaths, source_files: list[Path]) -> list[dict[str, Any]]:
     """DXFs and reference docs (PO PDFs etc.) land flat in the intake dir,
     matching the M59919 convention."""
@@ -443,10 +470,14 @@ def complete_intake(
     paths = resolve_job_paths(job_number, label)
 
     # Some jobs arrive as a path on W: instead of attachments - "please
-    # manufacture the parts at the following path". Pull the work files in so
-    # everything downstream sees one job folder, exactly as if they had been
-    # attached.
-    collected = list(files)
+    # manufacture the parts at the following path". Those files are referenced
+    # where they sit: W: is the source of truth for them, so copying would only
+    # create a second version to drift out of date, and the copy was the slowest
+    # part of an intake by a wide margin.
+    #
+    # Emailed attachments are different - they arrive in a temp directory that
+    # is deleted when the request finishes, so they must be copied.
+    in_place: list[Path] = []
     ingested_from: list[str] = []
     for candidate in paths_in_text(email_body):
         folder = Path(candidate)
@@ -458,13 +489,13 @@ def complete_intake(
             if item.is_file() and item.suffix.casefold() in INGESTED_SUFFIXES
         ]
         if pulled:
-            collected.extend(pulled)
+            in_place.extend(pulled)
             ingested_from.append(str(folder))
         # Only the first folder that actually holds work files; the candidate
         # list contains parent paths of it too.
         break
 
-    attachments = copy_attachments(paths, collected)
+    attachments = copy_attachments(paths, list(files)) + reference_files(in_place)
 
     dxf_names = [
         attachment["filename"]
@@ -514,7 +545,7 @@ def complete_intake(
             continue
         if not _looks_like_bom_spreadsheet(path):
             continue
-        conversion = convert_bom_spreadsheet(path)
+        conversion = convert_bom_spreadsheet(path, move_output_to=paths.intake_dir)
         for row in conversion.rows:
             cam_rows[Path(str(row["filename"])).stem.casefold()] = row
 
@@ -2344,13 +2375,22 @@ class BomConversion:
     nonlaser_parts: tuple[str, ...] = ()
 
 
-def convert_bom_spreadsheet(bom_path: Path) -> BomConversion:
+def convert_bom_spreadsheet(
+    bom_path: Path, *, move_output_to: Path | None = None
+) -> BomConversion:
     """Hand a spreadsheet BOM to inventor_to_radan and read back what it made.
 
     Returns its rows plus its own findings. Those findings are taken from the
     result object rather than recomputed here: it already checks DXF
     accountability as part of converting, and a second implementation would
     only be a second thing to disagree.
+
+    `move_output_to` cuts the two files it writes - the Radan CSV and the audit
+    report - into the job folder afterwards. The converter has to write beside
+    the spreadsheet, because it resolves each DXF relative to it; when the
+    spreadsheet is on W: that is the only write this app makes there, and it is
+    moved rather than copied so nothing is left behind in the customer's
+    folder.
 
     Never raises for a BOM that simply doesn't convert - intake continues on
     the scraped sources instead.
@@ -2410,7 +2450,38 @@ def convert_bom_spreadsheet(bom_path: Path) -> BomConversion:
                 )
     except OSError:
         return BomConversion(**findings)
+
+    if move_output_to is not None:
+        rows = _relocate_converter_output(
+            output, Path(getattr(result, "report_path", "") or ""), Path(move_output_to), rows
+        )
+
     return BomConversion(rows=tuple(rows), **findings)
+
+
+def _relocate_converter_output(
+    csv_path: Path, report_path: Path, destination: Path, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Move the converter's CSV and report into the job folder.
+
+    Moved, not copied: the spreadsheet may live in a customer folder on W:, and
+    leaving generated files there would be untidy at best. The rows themselves
+    still reference the DXFs where they sit, which is the point - only the two
+    files this app caused to be written are relocated.
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+    for source in (csv_path, report_path):
+        if not source or not source.exists():
+            continue
+        target = destination / source.name
+        try:
+            if target.exists():
+                target.unlink()
+            shutil.move(str(source), str(target))
+        except OSError:
+            # Leaving it where it is beats failing the intake over a tidy-up.
+            continue
+    return rows
 
 
 def apply_cam_bom(entry: dict[str, Any]) -> tuple[int, str]:
