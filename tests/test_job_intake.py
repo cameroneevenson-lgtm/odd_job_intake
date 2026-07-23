@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 from datetime import date
 import json
 from pathlib import Path
@@ -973,6 +974,9 @@ def test_files_already_on_the_shared_drive_are_referenced_not_copied(
     )
     shared = tmp_path / "W" / "Job 123"
     shared.mkdir(parents=True)
+    # This tmp folder stands in for W:\LASER, so it has to be approved the same
+    # way the real one is - an email may only pull from the shop's own shares.
+    monkeypatch.setattr(job_intake_service, "APPROVED_SOURCE_ROOTS", (tmp_path / "W",))
     _dxf_with_text(shared / "Panel.dxf", "GEOMETRY")
     (shared / "Panel.pdf").write_bytes(b"%PDF-1.4\n")
 
@@ -990,6 +994,92 @@ def test_files_already_on_the_shared_drive_are_referenced_not_copied(
 
     # The shared folder is left exactly as it was found.
     assert sorted(p.name for p in shared.iterdir()) == ["Panel.dxf", "Panel.pdf"]
+
+
+def test_an_email_may_only_pull_from_the_shops_own_shares(
+    tmp_path, monkeypatch, shop_csvs
+) -> None:
+    """An email body is untrusted text, and a path found in one gets listed and
+    read. Without a boundary, any folder a message named - including one in a
+    forwarded reply chain - could be pulled onto a job."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    monkeypatch.setattr(
+        job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
+    )
+    monkeypatch.setattr(job_intake_service, "APPROVED_SOURCE_ROOTS", (tmp_path / "W",))
+
+    elsewhere = tmp_path / "somebody-elses-folder"
+    elsewhere.mkdir()
+    _dxf_with_text(elsewhere / "NotOurs.dxf", "GEOMETRY")
+
+    entry = job_intake_service.create_intake(
+        "M50951", None, [], source="outlook", email_body=f"parts at {elsewhere} thanks"
+    )
+
+    assert entry["attachments"] == [], "read a folder it was not allowed to read"
+    assert entry["ingested_from"] == []
+    # Said so, rather than looking like the folder was empty.
+    assert any("outside the folders" in note for note in entry["po_unmatched"])
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        r"..\..\..\Windows\Temp",
+        "../escape",
+        r"sub\folder",
+        "C:Rush",
+        "..",
+        "Rush?Plates",
+        "CON",
+        "nul.txt",
+        "Rush Plates.",
+        "Rush\tPlates",
+        "x" * 65,
+    ],
+    ids=[
+        "windows-traversal", "posix-traversal", "separator", "drive-relative",
+        "dotdot", "invalid-char", "device-name", "device-name-with-extension",
+        "trailing-dot", "control-character", "too-long",
+    ],
+)
+def test_a_label_must_be_one_safe_folder_name(tmp_path, monkeypatch, label) -> None:
+    """A label comes from an email subject or a typed field and is joined
+    straight onto the job folder. Validated centrally, before any path is
+    resolved from it - checking containment afterwards would catch the escape
+    only after untrusted text had already decided the folder shape."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    with pytest.raises(JobIntakeError):
+        job_intake_service.resolve_job_paths("M59919", label)
+
+
+def test_an_ordinary_label_still_works(tmp_path, monkeypatch) -> None:
+    """The rules must not reject the labels people actually use."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    for label in ("Rush Plates", "PFF PO-8527-001", "Repair Brackets (2nd)", "Console 1.5"):
+        paths = job_intake_service.resolve_job_paths("M59919", label)
+        assert paths.intake_dir.name == label
+
+    # Surrounding whitespace is trimmed rather than refused - it is a typo, not
+    # an attempt at anything, and Windows would have dropped it silently.
+    assert job_intake_service.validate_label("  Rush Plates  ") == "Rush Plates"
+    assert job_intake_service.validate_label("   ") is None
+    assert job_intake_service.validate_label(None) is None
+
+
+def test_creating_folders_refuses_a_target_outside_the_shop_root(
+    tmp_path, monkeypatch
+) -> None:
+    """The containment check guarded delete and rename but not creation, which
+    is the one that runs on every intake."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    paths = job_intake_service.resolve_job_paths("M59919", "Rush Plates")
+    escaped = dataclasses.replace(paths, intake_dir=tmp_path / "elsewhere")
+
+    with pytest.raises(JobIntakeError) as excinfo:
+        job_intake_service.create_job_folders(escaped)
+    assert "outside" in str(excinfo.value)
+    assert not (tmp_path / "elsewhere").exists()
 
 
 def test_a_placeholder_number_needs_a_label_and_parks_each_job_separately(

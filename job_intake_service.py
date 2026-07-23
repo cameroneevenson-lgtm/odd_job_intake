@@ -20,6 +20,7 @@ from typing import Any
 import job_intake_registry
 from paths import (
     APP_DIR,
+    APPROVED_SOURCE_ROOTS,
     BATTLESHIELD_ROOT,
     EXPLORER_TEMPLATE_PATH,
     INVENTOR_TO_RADAN_DIR,
@@ -125,12 +126,71 @@ def job_folder_exists(job_number: str) -> bool:
     return (BATTLESHIELD_ROOT / root_name / number).exists()
 
 
+# Reserved on Windows whatever the extension, so a folder named for one of
+# these is a folder no tool can reliably open again.
+_WINDOWS_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{digit}" for digit in range(1, 10)]
+    + [f"LPT{digit}" for digit in range(1, 10)]
+)
+_LABEL_MAX_LENGTH = 64
+
+
+def validate_label(label: str | None) -> str | None:
+    """Check a label is one safe path component, and return it trimmed.
+
+    A label comes from an email subject or a typed field and is joined straight
+    onto the job folder, so it has to be a name rather than a path. Validated
+    here, in one place, before anything resolves a path from it - a containment
+    check afterwards would catch the escape but only after the folder shape had
+    already been decided by untrusted text.
+    """
+    text = str(label or "").strip()
+    if not text:
+        return None
+
+    if len(text) > _LABEL_MAX_LENGTH:
+        raise JobIntakeError(
+            f"That label is {len(text)} characters; keep it under "
+            f"{_LABEL_MAX_LENGTH} so it stays a usable folder name."
+        )
+    if any(separator in text for separator in ("/", "\\")):
+        raise JobIntakeError(
+            f"A label is a folder name, not a path: {text!r} contains a slash."
+        )
+    if ":" in text:
+        raise JobIntakeError(f"A label cannot contain a drive or stream marker: {text!r}")
+    # Includes "..", and any name that resolves to something other than itself.
+    if text in (".", "..") or Path(text).name != text:
+        raise JobIntakeError(f"{text!r} is not a usable folder name.")
+    invalid = set(text) & set('<>:"|?*')
+    if invalid:
+        raise JobIntakeError(
+            f"A label cannot contain {' '.join(sorted(invalid))} - Windows will not "
+            "accept it as a folder name."
+        )
+    if any(ord(character) < 32 for character in text):
+        raise JobIntakeError("A label cannot contain control characters.")
+    # Windows silently drops these, so the folder created would not be the
+    # folder recorded - and the mismatch would surface much later.
+    if text != text.rstrip(". "):
+        raise JobIntakeError(
+            f"A label cannot end with a dot or a space: {text!r}. Windows would "
+            "strip it and the folder name would stop matching what was filed."
+        )
+    if text.split(".")[0].upper() in _WINDOWS_DEVICE_NAMES:
+        raise JobIntakeError(
+            f"{text!r} is a reserved Windows device name and cannot be a folder."
+        )
+    return text
+
+
 def resolve_job_paths(job_number: str, label: str | None = None) -> JobPaths:
     number = str(job_number or "").strip().upper()
     root_name = resolve_job_root(number)
     release_root = BATTLESHIELD_ROOT / root_name
     job_dir = release_root / number
-    label_text = str(label or "").strip()
+    label_text = validate_label(label) or ""
 
     if label_text:
         # Existing job number (real truck or prior one-off): the one-off nests
@@ -156,6 +216,13 @@ def resolve_job_paths(job_number: str, label: str | None = None) -> JobPaths:
 
 
 def create_job_folders(paths: JobPaths) -> None:
+    # Applied to creation as well as delete/rename. validate_label() should
+    # already have made an escape impossible, but this is the check that
+    # actually looks at the resolved path, and mkdir is the first thing that
+    # writes anywhere - so it is worth confirming rather than assuming.
+    for folder in (paths.job_dir, paths.intake_dir, paths.project_dir):
+        _assert_under_shop_root(folder)
+
     if paths.label is None and is_placeholder_job_number(paths.job_number):
         raise JobIntakeError(
             f"{paths.job_number} is a placeholder for a number that hasn't been "
@@ -249,6 +316,63 @@ def paths_in_text(text: str) -> list[str]:
             candidate = trimmed.rsplit(" ", 1)[0]
     # Longest first so a full path wins over the parent folder it contains.
     return sorted(found, key=len, reverse=True)
+
+
+def is_approved_source_root(folder: Path) -> bool:
+    """Whether a path lifted out of an email may be read from.
+
+    An email body is untrusted text. A path found in one is followed, listed
+    and its files recorded onto the job, so it is confined to the shares this
+    work actually comes from - engineering's W:\\LASER and the shop's own
+    L:\\BATTLESHIELD. Without this, any readable folder named anywhere in a
+    message or its reply chain could be pulled into a job.
+    """
+    try:
+        resolved = Path(folder).resolve()
+    except OSError:
+        return False
+    for root in APPROVED_SOURCE_ROOTS:
+        try:
+            if resolved.is_relative_to(Path(root).resolve()):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def find_email_source_folder(
+    email_body: str,
+) -> tuple[Path | None, list[Path], list[Path]]:
+    """The folder an email points at, the work files in it, and what was skipped.
+
+    Returns (folder, files, rejected). Shared by the listener's pre-check and
+    the intake itself so the two cannot disagree about whether a message
+    actually pointed at any work - the listener answering 201 for a job the
+    intake then finds nothing in is a job folder on L: that someone has to go
+    and clean up.
+
+    Cheap enough to call twice: it lists one directory and copies nothing.
+    """
+    rejected: list[Path] = []
+    for candidate in paths_in_text(email_body):
+        folder = Path(candidate)
+        if not folder.is_dir():
+            continue
+        if not is_approved_source_root(folder):
+            rejected.append(folder)
+            continue
+        try:
+            pulled = [
+                item
+                for item in sorted(folder.iterdir())
+                if item.is_file() and item.suffix.casefold() in INGESTED_SUFFIXES
+            ]
+        except OSError:
+            continue
+        # Only the first folder that actually holds work files; the candidate
+        # list contains parent paths of it too.
+        return (folder, pulled, rejected) if pulled else (None, [], rejected)
+    return None, [], rejected
 
 
 @dataclass(frozen=True)
@@ -477,23 +601,19 @@ def complete_intake(
     #
     # Emailed attachments are different - they arrive in a temp directory that
     # is deleted when the request finishes, so they must be copied.
-    in_place: list[Path] = []
-    ingested_from: list[str] = []
-    for candidate in paths_in_text(email_body):
-        folder = Path(candidate)
-        if not folder.is_dir():
-            continue
-        pulled = [
-            item
-            for item in sorted(folder.iterdir())
-            if item.is_file() and item.suffix.casefold() in INGESTED_SUFFIXES
-        ]
-        if pulled:
-            in_place.extend(pulled)
-            ingested_from.append(str(folder))
-        # Only the first folder that actually holds work files; the candidate
-        # list contains parent paths of it too.
-        break
+    # Warnings this code raises, kept apart from `unmatched` - which holds PO
+    # lines that matched nothing and gets noise-filtered below. Mixing them let
+    # that filter silently eat real warnings twice, because a message about a
+    # BOM naturally contains the word "BOM". They are merged at the end.
+    notes: list[str] = []
+
+    folder, in_place, rejected = find_email_source_folder(email_body)
+    ingested_from = [str(folder)] if folder is not None else []
+    for skipped in rejected:
+        notes.append(
+            f"{skipped}: mentioned in the email but outside the folders this app "
+            f"reads from, so nothing was taken from it."
+        )
 
     attachments = copy_attachments(paths, list(files)) + reference_files(in_place)
 
@@ -533,12 +653,6 @@ def complete_intake(
     # A spreadsheet BOM outranks everything: it is structured CAM output, and
     # inventor_to_radan converts it with the shop's own rules rather than
     # anything guessed here.
-    # Warnings this code raises, kept apart from `unmatched` - which holds PO
-    # lines that matched nothing and gets noise-filtered below. Mixing them let
-    # that filter silently eat real warnings twice, because a message about a
-    # BOM naturally contains the word "BOM". They are merged at the end.
-    notes: list[str] = []
-
     cam_rows: dict[str, dict[str, Any]] = {}
     # Spreadsheet BOMs that were recognised but could not be converted. Carried
     # onto the entry so the import gate can refuse rather than proceed on the

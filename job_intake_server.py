@@ -136,6 +136,31 @@ def _decode_attachments(payload: Any, target_dir: Path) -> list[Path]:
     return written
 
 
+def _nothing_to_nest(email_body: str, rejected: list[Path]) -> str:
+    """Why this request had nothing to work with, specifically.
+
+    The three reasons are answered differently by the user - attach the DXFs,
+    fix the path, or move the work onto an approved share - so they are worth
+    telling apart rather than reporting as one generic refusal.
+    """
+    if rejected:
+        listed = ", ".join(str(path) for path in rejected[:3])
+        return (
+            f"No .dxf attachment, and the folder(s) named in the email are outside "
+            f"the shares this app reads from: {listed}. Attach the DXFs instead, or "
+            f"put the work on W: or L:."
+        )
+    if job_intake_service.paths_in_text(email_body):
+        return (
+            "No .dxf attachment, and the folder named in the email either does not "
+            "exist or holds no DXF/PDF/BOM files. Check the path."
+        )
+    return (
+        "No .dxf attachment and no folder path in the email body - there is "
+        "nothing to nest."
+    )
+
+
 def _finish_intake(
     entry: dict[str, Any], files: list[Path], email_body: str, staging: str
 ) -> None:
@@ -375,39 +400,34 @@ def create_app(
         # would find the directory gone. It is removed when that finishes.
         staging = tempfile.mkdtemp(prefix="odd_job_intake_")
         try:
-            if True:
-                attachments = payload.get("attachments") or []
-                files = (
-                    _decode_attachments(attachments, Path(staging)) if attachments else []
-                )
-                # A job can arrive as a path to W: with no attachments at all,
-                # so "nothing was attached" is only fatal when the body names
-                # no folder either.
-                if not any(path.name.casefold().endswith(".dxf") for path in files):
-                    if not job_intake_service.paths_in_text(email_body):
-                        return (
-                            jsonify(
-                                {
-                                    "error": (
-                                        "No .dxf attachment and no folder path in the "
-                                        "email body - there is nothing to nest."
-                                    )
-                                }
-                            ),
-                            400,
-                        )
+            attachments = payload.get("attachments") or []
+            files = _decode_attachments(attachments, Path(staging)) if attachments else []
 
-                # Only the fast, decisive half runs here: resolve the paths,
-                # enforce the fresh-vs-label rule, make the folder. That is
-                # what makes a second click fail on the already-exists guard
-                # rather than racing the first.
-                entry, _paths = job_intake_service.begin_intake(
-                    job_number,
-                    label or None,
-                    source="outlook",
-                    email_subject=str(payload.get("email_subject", "") or ""),
-                    email_sender=str(payload.get("email_sender", "") or ""),
+            # A job can arrive as a path to W: with no attachments at all, so
+            # "nothing was attached" is only fatal when the body doesn't point
+            # at a readable folder holding work either.
+            #
+            # Checked here rather than left to the background half: answering
+            # 201 and then finding nothing would leave an empty job folder on
+            # L: for someone to clean up, and tell the user it worked.
+            if not any(path.name.casefold().endswith(".dxf") for path in files):
+                folder, found, rejected = job_intake_service.find_email_source_folder(
+                    email_body
                 )
+                if folder is None:
+                    return jsonify({"error": _nothing_to_nest(email_body, rejected)}), 400
+
+            # Only the fast, decisive half runs here: resolve the paths,
+            # enforce the fresh-vs-label rule, make the folder. That is
+            # what makes a second click fail on the already-exists guard
+            # rather than racing the first.
+            entry, _paths = job_intake_service.begin_intake(
+                job_number,
+                label or None,
+                source="outlook",
+                email_subject=str(payload.get("email_subject", "") or ""),
+                email_sender=str(payload.get("email_sender", "") or ""),
+            )
         except JobIntakeError as exc:
             shutil.rmtree(staging, ignore_errors=True)
             return jsonify({"error": str(exc)}), 400

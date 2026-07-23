@@ -221,11 +221,16 @@ def test_non_dxf_pdf_attachments_are_refused(client) -> None:
     assert "logo.png" in response.get_json()["error"]
 
 
-def test_an_email_that_is_only_a_folder_path_is_accepted(client, tmp_path: Path) -> None:
+def test_an_email_that_is_only_a_folder_path_is_accepted(
+    client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Some jobs arrive as a path to W: with no attachments at all, so an
-    empty attachment list is only fatal when the body names no folder."""
+    empty attachment list is only fatal when the body points at no work."""
     shared = tmp_path / "W" / "LASER" / "Job 123"
     shared.mkdir(parents=True)
+    (shared / "Panel.dxf").write_text("0\nSECTION\n", encoding="utf-8")
+    # Stands in for the real W:\LASER.
+    monkeypatch.setattr(job_intake_service, "APPROVED_SOURCE_ROOTS", (tmp_path / "W",))
 
     response = client.post(
         "/api/job-intake",
@@ -241,6 +246,47 @@ def test_an_email_that_is_only_a_folder_path_is_accepted(client, tmp_path: Path)
     entry = job_intake_registry.load_entries()[0]
     assert str(shared) in entry["source_paths"]
     assert "Parts are here" in entry["email_body"]
+
+
+def test_an_email_pointing_at_an_empty_folder_is_refused_up_front(
+    client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Answering 201 and only then finding nothing would leave an empty job
+    folder on L: for someone to clean up, having told the user it worked."""
+    shared = tmp_path / "W" / "LASER" / "Job 456"
+    shared.mkdir(parents=True)
+    monkeypatch.setattr(job_intake_service, "APPROVED_SOURCE_ROOTS", (tmp_path / "W",))
+
+    response = client.post(
+        "/api/job-intake",
+        json=_payload(job_number="M90778", attachments=[], email_body=f"see {shared}"),
+        headers=AUTH,
+    )
+    assert response.status_code == 400
+    assert "holds no DXF" in response.get_json()["error"]
+    assert job_intake_registry.load_entries() == []
+
+
+def test_an_email_pointing_outside_the_approved_shares_is_refused_and_says_so(
+    client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An email body is untrusted text; a path in one is followed and read. The
+    refusal names the folder, because "put the work on W:" is the fix."""
+    elsewhere = tmp_path / "somewhere-else"
+    elsewhere.mkdir()
+    (elsewhere / "Panel.dxf").write_text("0\nSECTION\n", encoding="utf-8")
+    monkeypatch.setattr(job_intake_service, "APPROVED_SOURCE_ROOTS", (tmp_path / "W",))
+
+    response = client.post(
+        "/api/job-intake",
+        json=_payload(job_number="M90779", attachments=[], email_body=f"see {elsewhere}"),
+        headers=AUTH,
+    )
+    assert response.status_code == 400
+    error = response.get_json()["error"]
+    assert "outside the shares" in error
+    assert str(elsewhere) in error
+    assert job_intake_registry.load_entries() == []
 
 
 def test_a_path_that_does_not_exist_is_not_recorded_as_a_source(client) -> None:

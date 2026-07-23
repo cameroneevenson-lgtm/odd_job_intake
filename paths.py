@@ -35,6 +35,16 @@ JOB_PREFIX_TO_ROOT = {
 
 JOB_INTAKE_REGISTRY_PATH = APP_DIR / "_runtime" / "job_intake_registry.json"
 
+# Where an email is allowed to point. A message body is untrusted text, and a
+# path lifted out of one is followed and read, so it is restricted to the two
+# shares this work legitimately comes from: engineering's laser folder on W:
+# and the shop's own job roots on L:. Anything else is ignored rather than
+# refused, because prose contains paths that were never an instruction.
+APPROVED_SOURCE_ROOTS = (
+    Path(r"W:\LASER"),
+    BATTLESHIELD_ROOT,
+)
+
 # Placeholder numbers for work that arrives before it has been assigned one -
 # "start looking at it, the number comes later". The prefix still picks the
 # root, so an M placeholder lands under M-FABRICATION like any other.
