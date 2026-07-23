@@ -228,6 +228,45 @@ def test_choosing_a_material_by_hand_counts_as_verifying_it(qapp, isolated_roots
         page.deleteLater()
 
 
+def test_saving_in_the_ui_preserves_conflict_evidence(qapp, isolated_roots) -> None:
+    """The P0 this was written for.
+
+    Every import action saves first and validates afterwards. Save used to
+    rebuild each row from the visible grid cells, which dropped the conflict
+    evidence - so by the time the gate looked, there was nothing left to block
+    on. Edits must be merged into the stored row, never reconstruct it.
+    """
+    page = _make_page(qapp)
+    try:
+        page._create_intake("M50700", "", [_dxf(isolated_roots, "Bracket.DXF")])
+        page.refresh()
+        page.queue_table.selectRow(0)
+
+        # Plant a conflict the way extraction would.
+        entry = job_intake_registry.get_entry("M50700")
+        entry["material_qty"][0]["conflicts"] = {
+            "material": "the PO says Aluminum 5052, the print says Mild Steel-A36"
+        }
+        entry["material_qty"][0]["resolved"] = {}
+        job_intake_registry.update_entry("M50700", material_qty=entry["material_qty"])
+        page.refresh()
+        page.queue_table.selectRow(0)
+
+        saved = page._save_details()
+        assert saved is not None
+
+        part = saved["material_qty"][0]
+        assert part["conflicts"].get("material"), "save erased the conflict"
+        assert not part["resolved"].get("material")
+
+        # And the gate still fires on what the save produced.
+        with pytest.raises(job_intake_service.JobIntakeError) as excinfo:
+            job_intake_service.build_import_csv_rows(saved)
+        assert "STOP" in str(excinfo.value)
+    finally:
+        page.deleteLater()
+
+
 def test_material_edit_autofills_strategy_and_saves(qapp, isolated_roots) -> None:
     page = _make_page(qapp)
     try:

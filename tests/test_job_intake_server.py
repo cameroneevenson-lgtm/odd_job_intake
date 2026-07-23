@@ -118,7 +118,9 @@ def test_submit_creates_folder_and_registry_entry_with_outlook_source(client) ->
             "qty_unknown": True,
             "qty_source_text": "",
             # Only one source spoke, so there is nothing to disagree about.
-            "source_conflict": "",
+            # Tracked per field, and never rewritten by the UI.
+            "conflicts": {},
+            "resolved": {},
         }
     ]
 

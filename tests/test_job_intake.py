@@ -767,7 +767,7 @@ def test_a_po_and_a_print_disagreeing_on_material_is_a_hard_stop(
     entry = job_intake_service.create_intake("M90302", None, [dxf, print_pdf, po_pdf])
     part = entry["material_qty"][0]
 
-    conflict = part["source_conflict"]
+    conflict = part["conflicts"]["material"]
     assert "the PO says Aluminum 5052" in conflict
     assert "the print says Mild Steel-A36" in conflict
 
@@ -822,10 +822,10 @@ def test_conflicting_sources_are_a_hard_stop(tmp_path: Path) -> None:
     either way."""
     entry = _entry_with_parts(tmp_path)
     part = entry["material_qty"][0]
-    part["material_confirmed"] = False
-    part["source_conflict"] = (
-        "material - the CAM BOM says Mild Steel-A36, the print says Aluminum 5052"
-    )
+    part["conflicts"] = {
+        "material": "the CAM BOM says Mild Steel-A36, the print says Aluminum 5052"
+    }
+    part["resolved"] = {}
 
     with pytest.raises(JobIntakeError) as excinfo:
         build_import_csv_rows(entry)
@@ -835,8 +835,26 @@ def test_conflicting_sources_are_a_hard_stop(tmp_path: Path) -> None:
     assert "Mild Steel-A36" in message and "Aluminum 5052" in message
     assert "whoever requested the job" in message
 
-    # A human deciding is the only thing that clears it.
+    # A human deciding that field is the only thing that clears it.
+    part["resolved"] = {"material": True}
+    assert len(build_import_csv_rows(entry)) == 1
+
+
+def test_settling_the_material_does_not_release_a_disputed_quantity(tmp_path: Path) -> None:
+    """The gate is per field. Ticking Verified on the material used to clear
+    every conflict on the row, including a quantity two sources disagreed
+    about - which is the one that decides how much metal gets cut."""
+    entry = _entry_with_parts(tmp_path)
+    part = entry["material_qty"][0]
+    part["conflicts"] = {"quantity": "the CAM BOM says 12, the print says 1"}
+    part["resolved"] = {"material": True, "material_confirmed": True}
     part["material_confirmed"] = True
+
+    with pytest.raises(JobIntakeError) as excinfo:
+        build_import_csv_rows(entry)
+    assert "quantity" in str(excinfo.value)
+
+    part["resolved"]["quantity"] = True
     assert len(build_import_csv_rows(entry)) == 1
 
 

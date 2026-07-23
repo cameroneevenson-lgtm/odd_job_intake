@@ -786,6 +786,16 @@ class JobIntakePage(QWidget):
             )
 
     def _collect_detail_fields(self) -> dict[str, Any]:
+        # The rows as stored, keyed by filename. Edits are merged into these so
+        # extracted evidence - conflicts, source text, what each reading said -
+        # survives a save. It is not editable and must not be reconstructed
+        # from the grid.
+        selected = self._selected_entry() or {}
+        existing_by_name = {
+            str(part.get("filename", "")): part
+            for part in selected.get("material_qty", [])
+        }
+
         parts: list[dict[str, Any]] = []
         for row in range(self.parts_table.rowCount()):
             def _cell(column: int) -> str:
@@ -801,17 +811,36 @@ class JobIntakePage(QWidget):
             except ValueError:
                 qty = 1
             verified_item = self.parts_table.item(row, PART_VERIFIED_COL)
-            parts.append(
+            filename = _cell(PART_DXF_COL)
+
+            # Start from the stored row and overwrite only what the grid can
+            # edit. Rebuilding it from the visible cells is what erased the
+            # conflict evidence, and since save runs before every import gate,
+            # that disarmed the gate on the way past it.
+            stored = dict(existing_by_name.get(filename, {}))
+            material = _cell(PART_MATERIAL_COL)
+            resolved = dict(stored.get("resolved") or {})
+
+            # Choosing a value for a field is what settles a dispute about it -
+            # a real decision, not a generic acknowledgement.
+            if material and material != stored.get("material"):
+                resolved["material"] = True
+            if thickness and thickness != stored.get("thickness"):
+                resolved["thickness"] = True
+            if row in self._qty_answered:
+                resolved["quantity"] = True
+            if verified_item is not None and verified_item.checkState() == Qt.CheckState.Checked:
+                # The checkbox speaks only for the material.
+                resolved["material"] = True
+
+            stored.update(
                 {
-                    "filename": _cell(PART_DXF_COL),
-                    "material": _cell(PART_MATERIAL_COL),
+                    "filename": filename,
+                    "material": material,
                     "thickness": thickness,
                     "qty": qty,
                     "unit": _cell(PART_UNIT_COL) or "in",
                     "strategy": _cell(PART_STRATEGY_COL),
-                    "po_ref": _cell(PART_PO_REF_COL),
-                    "dxf_ref": _cell(PART_DXF_REF_COL),
-                    "material_source_text": _cell(PART_DRAWING_SAYS_COL),
                     "material_confirmed": (
                         verified_item is not None
                         and verified_item.checkState() == Qt.CheckState.Checked
@@ -821,8 +850,10 @@ class JobIntakePage(QWidget):
                         bool(self._unknown_qty_rows.get(row))
                         and row not in self._qty_answered
                     ),
+                    "resolved": resolved,
                 }
             )
+            parts.append(stored)
         due_date = (
             self.due_date_edit.date().toString("yyyy-MM-dd") if self.due_date_check.isChecked() else None
         )

@@ -235,8 +235,13 @@ class EmailHints:
     """
 
     material: str | None = None
+    thickness: float | None = None
     qty: int | None = None
     material_source_text: str | None = None
+    qty_source_text: str | None = None
+    # True when the wording is explicitly per-part ("4 each", "all parts"), so
+    # one number can safely be applied to a multi-part job.
+    qty_is_per_part: bool = False
 
 
 def extract_email_hints(text: str) -> EmailHints:
@@ -262,7 +267,8 @@ def extract_email_hints(text: str) -> EmailHints:
         material = source = None
 
     qty = None
-    for pattern in (_DXF_QTY_PATTERN, _DXF_QTY_SUFFIX_PATTERN):
+    qty_source = None
+    for pattern in (_DXF_QTY_PATTERN, _DXF_QTY_SUFFIX_PATTERN, _PROSE_QTY_PATTERN):
         match = pattern.search(body)
         if match is not None:
             try:
@@ -271,9 +277,29 @@ def extract_email_hints(text: str) -> EmailHints:
                 continue
             if 0 < candidate <= 9999:
                 qty = candidate
+                qty_source = match.group(0).strip()
                 break
 
-    return EmailHints(material=material, qty=qty, material_source_text=source)
+    per_part = bool(
+        qty is not None
+        and re.search(r"\b(?:each|per\s+part|apiece|all\s+parts?)\b", body, re.IGNORECASE)
+    )
+
+    # Thickness stated in the message, so it can dispute the other sources
+    # rather than only the print and drawing being allowed an opinion.
+    thickness = None
+    thickness_match = _DXF_THICKNESS_PATTERN.search(body)
+    if thickness_match is not None and material is not None:
+        thickness = snap_thickness(_parse_fraction_or_number(thickness_match.group(1)), material)
+
+    return EmailHints(
+        material=material,
+        thickness=thickness,
+        qty=qty,
+        material_source_text=source,
+        qty_source_text=qty_source,
+        qty_is_per_part=per_part,
+    )
 
 
 def intake_summary_text(entry: dict[str, Any]) -> str:
@@ -645,11 +671,34 @@ def complete_intake(
             "the drawing": dxf_hints.material,
         }
         named = {where: value for where, value in stated.items() if value}
-        source_conflict = ""
+        # Tracked per field, not as one blob: a quantity disagreement must not
+        # be clearable by settling the material, and vice versa.
+        conflicts: dict[str, str] = {}
         if len(set(named.values())) > 1:
             detail = ", ".join(f"{where} says {value}" for where, value in named.items())
-            source_conflict = f"material - {detail}"
+            conflicts["material"] = detail
             note = f"{name}: sources disagree on material - {detail}"
+            if note not in notes:
+                notes.append(note)
+
+        # Thickness was previously resolved by precedence with no check at all,
+        # so two sources quietly disagreeing about how thick a part is went
+        # unnoticed. Every source that can choose a value now also disputes it.
+        thickness_stated = {
+            "the CAM BOM": cam_row["thickness"] if cam_row else None,
+            "the BOM": bom_thickness,
+            "the print": print_hints.thickness,
+            "the drawing": dxf_hints.thickness,
+        }
+        thickness_named = {
+            where: value for where, value in thickness_stated.items() if value
+        }
+        if len(set(thickness_named.values())) > 1:
+            detail = ", ".join(
+                f"{where} says {value:g}" for where, value in thickness_named.items()
+            )
+            conflicts["thickness"] = detail
+            note = f"{name}: sources disagree on thickness - {detail}"
             if note not in notes:
                 notes.append(note)
 
@@ -672,30 +721,41 @@ def complete_intake(
         # note. Neither may be invented - a blank QTY or a "REFER TO BOM" is
         # recorded as unknown rather than defaulting to 1, because silently
         # cutting one of a forty-off part is the expensive failure here.
+        # An email states a quantity for "the job", but the job may be thirteen
+        # different parts - applying one number to all of them would cut twelve
+        # of them wrong. Only trusted when it cannot be misapplied: a single-DXF
+        # job, or wording that is explicitly per-part ("4 each", "all parts").
+        email_qty = (
+            email_hints.qty
+            if email_hints.qty and (len(dxf_names) == 1 or email_hints.qty_is_per_part)
+            else None
+        )
+
         resolved_qty = (
             (cam_row["qty"] if cam_row else None)
             or po_qty
             or (bom_row.qty if bom_row is not None else None)
-            or email_hints.qty
+            or email_qty
             or print_hints.qty
             or dxf_hints.qty
         )
         qty_unknown = resolved_qty is None
 
+        # Email and drawing are included: both can win the value above, so both
+        # must be able to dispute it. Leaving them out meant a source could
+        # decide an answer it was never allowed to argue about.
         qty_stated = {
             "the CAM BOM": cam_row["qty"] if cam_row else None,
             "the PO": po_qty,
             "the BOM": bom_row.qty if bom_row is not None else None,
+            "the email": email_qty,
             "the print": print_hints.qty,
+            "the drawing": dxf_hints.qty,
         }
         qty_named = {where: value for where, value in qty_stated.items() if value}
         if len(set(qty_named.values())) > 1:
             detail = ", ".join(f"{where} says {value}" for where, value in qty_named.items())
-            source_conflict = (
-                f"{source_conflict}; quantity - {detail}"
-                if source_conflict
-                else f"quantity - {detail}"
-            )
+            conflicts["quantity"] = detail
             note = f"{name}: sources disagree on quantity - {detail}"
             if note not in notes:
                 notes.append(note)
@@ -724,11 +784,19 @@ def complete_intake(
                 # placeholder rather than an answer.
                 "qty_unknown": qty_unknown,
                 "qty_source_text": str(print_hints.qty_source_text or ""),
-                # Two sources gave different answers. This is a hard stop, not
-                # a note: it means somebody has to go back to whoever asked for
-                # the job and find out which is right. Ranking one source over
-                # another would just be picking a winner silently.
-                "source_conflict": source_conflict,
+                # Two sources gave different answers. A hard stop, not a note:
+                # somebody has to go back to whoever asked for the job and find
+                # out which is right, because ranking one source over another
+                # would just be picking a winner silently.
+                #
+                # Per field, and never rewritten by the UI - this is extracted
+                # evidence, not an editable decision. Rebuilding the row on save
+                # used to erase it, which quietly disarmed the gate.
+                "conflicts": conflicts,
+                # Which fields a human has since settled. Resolving means
+                # choosing a value for *that* field; settling the material says
+                # nothing about a disputed quantity.
+                "resolved": {},
             }
         )
 
@@ -1381,9 +1449,17 @@ _DXF_READ_LIMIT = 12 * 1024 * 1024
 _DXF_QTY_PATTERN = re.compile(
     r"\b(?:QTY|QUANTITY|REQD|REQUIRED)\b\s*[:.\-]?\s*(\d{1,4})\b", re.IGNORECASE
 )
-# "2 OFF", "4 PLCS", "3 REQ'D"
+# "2 OFF", "4 PLCS", "3 REQ'D", "10 REQUIRED" - the number before the word.
 _DXF_QTY_SUFFIX_PATTERN = re.compile(
-    r"\b(\d{1,4})\s*(?:OFF|PLCS?|PCS?|REQ'?D)\b", re.IGNORECASE
+    r"\b(\d{1,4})\s*(?:OFF|PLCS?|PCS?|REQ'?D|REQUIRED)\b", re.IGNORECASE
+)
+# How people actually write it in an email: "can you make 19", "cut 6 of
+# these", "we need 4". The negative lookahead keeps dimensions out - "cut 19
+# inches", "19 x 40", "make 19mm" are not quantities.
+_PROSE_QTY_PATTERN = re.compile(
+    r"\b(?:make|cut|need|needs|produce|run|fabricate|do)\s+(\d{1,4})\b"
+    r"(?!\s*(?:x\b|[\"']|in\b|inch|mm\b|ga\b|gauge|thk|thick))",
+    re.IGNORECASE,
 )
 _DXF_THICKNESS_PATTERN = re.compile(
     # Leading-dot decimals first: drawings write ".125 THK" far more often than
@@ -2516,11 +2592,22 @@ def build_import_csv_rows(entry: dict[str, Any]) -> list[list[str]]:
         # A disagreement between sources is a hard stop. Whoever asked for the
         # job has to say which is right - the alternative is cutting metal on
         # a guess about whose paperwork was newer.
-        conflict = str(part.get("source_conflict", "") or "").strip()
-        if conflict and not part.get("material_confirmed"):
+        #
+        # Checked per field: settling the material must not release a disputed
+        # quantity. Each is cleared by choosing a value for that field, which
+        # is a real decision rather than a generic acknowledgement.
+        conflicts = part.get("conflicts") or {}
+        resolved = part.get("resolved") or {}
+        open_conflicts = [
+            f"{field} - {detail}"
+            for field, detail in conflicts.items()
+            if detail and not resolved.get(field)
+        ]
+        if open_conflicts:
             problems.append(
-                f"{filename}: STOP - {conflict}. Confirm with whoever requested "
-                f"the job, then set the material and tick Verified"
+                f"{filename}: STOP - "
+                + "; ".join(open_conflicts)
+                + ". Confirm with whoever requested the job, then set that field"
             )
             continue
 
