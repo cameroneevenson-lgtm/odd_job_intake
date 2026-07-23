@@ -30,7 +30,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
     )
-    app = job_intake_server.create_app(token=TOKEN)
+    app = job_intake_server.create_app(token=TOKEN, run_in_background=False)
     app.config["TESTING"] = True
     return app.test_client()
 
@@ -341,7 +341,7 @@ def addin_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
     )
-    app = job_intake_server.create_app(token=TOKEN, port=9999)
+    app = job_intake_server.create_app(token=TOKEN, port=9999, run_in_background=False)
     app.config["TESTING"] = True
     return app.test_client()
 
@@ -420,7 +420,7 @@ def test_template_and_static_paths_do_not_depend_on_sys_modules() -> None:
 
     from paths import APP_DIR
 
-    app = job_intake_server.create_app(token=TOKEN, port=9999)
+    app = job_intake_server.create_app(token=TOKEN, port=9999, run_in_background=False)
     assert Path(app.root_path) == APP_DIR
     assert Path(app.template_folder) == APP_DIR / "templates"
     assert Path(app.static_folder) == APP_DIR / "static"
@@ -429,7 +429,7 @@ def test_template_and_static_paths_do_not_depend_on_sys_modules() -> None:
     # host leaves things, and confirm it still renders.
     saved = sys.modules.pop("job_intake_server", None)
     try:
-        embedded = job_intake_server.create_app(token=TOKEN, port=9999)
+        embedded = job_intake_server.create_app(token=TOKEN, port=9999, run_in_background=False)
         embedded.config["TESTING"] = True
         response = embedded.test_client().get("/addin/taskpane")
         assert response.status_code == 200

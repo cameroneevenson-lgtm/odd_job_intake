@@ -23,9 +23,12 @@ import logging
 import os
 from pathlib import Path
 import secrets
+import shutil
 import tempfile
 import threading
 from typing import Any
+
+import job_intake_registry
 
 from flask import Flask, Response, jsonify, render_template, request, send_from_directory
 
@@ -133,7 +136,46 @@ def _decode_attachments(payload: Any, target_dir: Path) -> list[Path]:
     return written
 
 
-def create_app(token: str | None = None, port: int | None = None) -> Flask:
+def _finish_intake(
+    entry: dict[str, Any], files: list[Path], email_body: str, staging: str
+) -> None:
+    """The slow half of an intake, off the request thread.
+
+    Copies the work files in, scrapes them and registers the finished entry.
+    Failures are recorded on the entry rather than raised: nobody is waiting
+    on this call, and a job whose folder exists but whose parts didn't resolve
+    is still better surfaced in the queue than lost.
+    """
+    key = str(entry.get("key", ""))
+    try:
+        job_intake_service.complete_intake(entry, files, email_body=email_body)
+        _logger.info("Completed intake %s (%d parts).", key, len(entry.get("material_qty", [])))
+    except Exception as exc:
+        _logger.exception("Intake %s failed after being queued.", key)
+        # The entry already exists - begin_intake claimed it - so the failure
+        # is recorded on it and shows up in the desktop queue.
+        try:
+            job_intake_registry.update_entry(
+                key, error=f"Intake failed after queuing: {exc}"
+            )
+        except ValueError:
+            _logger.error("Could not record the failure for %s.", key)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def create_app(
+    token: str | None = None,
+    port: int | None = None,
+    *,
+    run_in_background: bool = True,
+) -> Flask:
+    """The listener.
+
+    `run_in_background` is what makes the request return before the slow half
+    finishes. Tests turn it off so a POST is complete when it returns; leaving
+    it on there would mean racing a thread for every assertion.
+    """
     # Pin root/template/static paths explicitly instead of letting Flask infer
     # them from __name__. When master_app embeds this repo it loads the modules
     # and then removes them from sys.modules, so Flask's inference falls back
@@ -261,8 +303,11 @@ def create_app(token: str | None = None, port: int | None = None) -> Flask:
         job_number = str(payload.get("job_number", "")).strip().upper()
         label = str(payload.get("label", "") or "").strip()
         email_body = str(payload.get("email_body", "") or "")
+        # Not a context manager: the slow half runs on a background thread and
+        # would find the directory gone. It is removed when that finishes.
+        staging = tempfile.mkdtemp(prefix="odd_job_intake_")
         try:
-            with tempfile.TemporaryDirectory(prefix="odd_job_intake_") as staging:
+            if True:
                 attachments = payload.get("attachments") or []
                 files = (
                     _decode_attachments(attachments, Path(staging)) if attachments else []
@@ -284,38 +329,71 @@ def create_app(token: str | None = None, port: int | None = None) -> Flask:
                             400,
                         )
 
-                entry = job_intake_service.create_intake(
+                # Only the fast, decisive half runs here: resolve the paths,
+                # enforce the fresh-vs-label rule, make the folder. That is
+                # what makes a second click fail on the already-exists guard
+                # rather than racing the first.
+                entry, _paths = job_intake_service.begin_intake(
                     job_number,
                     label or None,
-                    files,
                     source="outlook",
                     email_subject=str(payload.get("email_subject", "") or ""),
                     email_sender=str(payload.get("email_sender", "") or ""),
-                    email_body=email_body,
                 )
         except JobIntakeError as exc:
+            shutil.rmtree(staging, ignore_errors=True)
             return jsonify({"error": str(exc)}), 400
         except ValueError as exc:
             # Raised by the registry when this job/label was already filed.
+            shutil.rmtree(staging, ignore_errors=True)
             return jsonify({"error": str(exc)}), 409
         except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
             _logger.exception("Job intake from Outlook failed for %r.", job_number)
             return jsonify({"error": "The intake failed; check the desktop app's log."}), 500
 
-        _logger.info("Filed Outlook intake %s (%d attachments).", entry.get("key"), len(files))
+        # The slow half - copying files off W:, scraping the PDFs, converting a
+        # BOM - runs on a background thread. A real job took 53s where the
+        # caller's socket gives up at 30, and it reported a success as a
+        # failure. There is no way to push the result back afterwards, so the
+        # answers that need the work done are returned as "pending" and the
+        # desktop queue fills them in as it polls.
+        if run_in_background:
+            threading.Thread(
+                target=_finish_intake,
+                args=(entry, files, email_body, staging),
+                name=f"job-intake-{entry.get('key')}",
+                daemon=True,
+            ).start()
+        else:
+            _finish_intake(entry, files, email_body, staging)
+
+        _logger.info("Queued Outlook intake %s (%d attachments).", entry.get("key"), len(files))
         return (
             jsonify(
                 {
                     "key": entry.get("key"),
                     "job_number": entry.get("job_number"),
                     "label": entry.get("label"),
-                    "po_number": entry.get("po_number"),
-                    "due_date": entry.get("due_date"),
+                    # Known only after the files are read - the existing macro
+                    # prints whatever it finds here, so these read as "pending"
+                    # rather than as a blank or a wrong zero.
+                    "po_number": entry.get("po_number") if not run_in_background else "pending",
+                    "due_date": entry.get("due_date") if not run_in_background else "pending",
+                    "parts": (
+                        len(entry.get("material_qty", []))
+                        if not run_in_background
+                        else "pending"
+                    ),
+                    # Derived from the job number alone, so it is real already.
                     "job_folder": entry.get("job_folder"),
-                    "status": entry.get("status"),
-                    "attachments": [item.get("filename") for item in entry.get("attachments", [])],
-                    "parts": len(entry.get("material_qty", [])),
-                    "po_unmatched": entry.get("po_unmatched", []),
+                    "status": entry.get("status") if not run_in_background else "queued",
+                    "attachments": (
+                        [str(item.get("filename")) for item in entry.get("attachments", [])]
+                        if not run_in_background
+                        else [Path(path).name for path in files]
+                    ),
+                    "po_unmatched": entry.get("po_unmatched", []) if not run_in_background else [],
                 }
             ),
             201,

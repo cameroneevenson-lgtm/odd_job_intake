@@ -276,6 +276,45 @@ def extract_email_hints(text: str) -> EmailHints:
     return EmailHints(material=material, qty=qty, material_source_text=source)
 
 
+def begin_intake(
+    job_number: str,
+    label: str | None,
+    *,
+    source: str = "manual",
+    email_subject: str = "",
+    email_sender: str = "",
+) -> tuple[dict[str, Any], JobPaths]:
+    """The fast half of an intake: validate, make the folder, register it.
+
+    Split out so a caller that can't afford to wait - the loopback listener,
+    whose client times out after 30s while a network-to-network copy of a real
+    job takes closer to a minute - can answer immediately and finish the slow
+    half on a background thread.
+
+    Everything here is decisive and quick: it resolves the paths, enforces the
+    fresh-vs-label rule, creates the directories and writes the registry entry.
+    Doing that up front means a second click is rejected by the existing
+    already-exists guard rather than racing the first, and the job appears in
+    the desktop queue straight away.
+    """
+    paths = resolve_job_paths(job_number, label or None)
+    create_job_folders(paths)
+
+    entry = job_intake_registry.new_entry(
+        job_number=job_number,
+        label=label or None,
+        source=source,
+        email_subject=email_subject,
+        email_sender=email_sender,
+    )
+    entry["job_folder"] = str(paths.intake_dir)
+    # Claim the registry key here too, not just the folder. Both are how a job
+    # is claimed, and leaving the append to the slow half meant a duplicate
+    # surfaced long after the caller had been told the job was accepted.
+    job_intake_registry.append_entry(entry)
+    return entry, paths
+
+
 def create_intake(
     job_number: str,
     label: str | None,
@@ -295,8 +334,29 @@ def create_intake(
     parts, and sending blocks stay explicit user actions on the desktop page,
     so an Outlook-driven intake can never block on RADAN COM automation.
     """
-    paths = resolve_job_paths(job_number, label or None)
-    create_job_folders(paths)
+    entry, _paths = begin_intake(
+        job_number,
+        label,
+        source=source,
+        email_subject=email_subject,
+        email_sender=email_sender,
+    )
+    return complete_intake(entry, files, email_body=email_body)
+
+
+def complete_intake(
+    entry: dict[str, Any], files: list[Path], *, email_body: str = ""
+) -> dict[str, Any]:
+    """The slow half: copy the work files in, read them, register the entry.
+
+    Takes the entry begin_intake made, so the folder already exists and the
+    job is already claimed. Split out so the listener can run this on a
+    background thread after answering - a real job spent 53s here, past the
+    30s its caller waits.
+    """
+    job_number = str(entry.get("job_number", ""))
+    label = entry.get("label")
+    paths = resolve_job_paths(job_number, label)
 
     # Some jobs arrive as a path on W: instead of attachments - "please
     # manufacture the parts at the following path". Pull the work files in so
@@ -614,13 +674,6 @@ def create_intake(
             }
         )
 
-    entry = job_intake_registry.new_entry(
-        job_number=job_number,
-        label=label or None,
-        source=source,
-        email_subject=email_subject,
-        email_sender=email_sender,
-    )
     # Kept whole so later passes (material/qty scraped from the message, or a
     # W: folder named in it) can re-read it without the email being needed
     # again. The macro sends it raw precisely so this stays changeable here.
@@ -666,7 +719,22 @@ def create_intake(
         # Recorded rather than raised - the job folder and parts are fine, and
         # this is retryable from the desktop page.
         entry["error"] = entry_rpd_error
-    job_intake_registry.append_entry(entry)
+
+    # Updated, not appended: begin_intake already claimed the key. Written in
+    # one call so the queue never shows a half-filled job.
+    job_intake_registry.update_entry(
+        str(entry["key"]),
+        **{
+            field: entry[field]
+            for field in (
+                "provisional", "ingested_from", "source_paths", "job_folder",
+                "po_number", "due_date", "due_note", "attachments",
+                "material_qty", "po_unmatched", "email_body", "status",
+                "rpd_path", "error",
+            )
+            if field in entry
+        },
+    )
     return entry
 
 
