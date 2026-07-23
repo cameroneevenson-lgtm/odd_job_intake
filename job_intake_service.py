@@ -438,10 +438,25 @@ def extract_email_hints(text: str) -> EmailHints:
 
     # Thickness stated in the message, so it can dispute the other sources
     # rather than only the print and drawing being allowed an opinion.
+    #
+    # Gauges are read here for the same reason the drawing and print scrapers
+    # read them: an email is where shop shorthand is most likely to appear -
+    # "make these in 11ga" - and this was the one source that could not
+    # understand it. Only with a material in hand, because 11GA is 0.118 in
+    # steel and 0.090 in aluminium.
     thickness = None
-    thickness_match = _DXF_THICKNESS_PATTERN.search(body)
-    if thickness_match is not None and material is not None:
-        thickness = snap_thickness(_parse_fraction_or_number(thickness_match.group(1)), material)
+    if material is not None:
+        thickness_match = _DXF_THICKNESS_PATTERN.search(body)
+        if thickness_match is not None:
+            thickness = snap_thickness(
+                _parse_fraction_or_number(thickness_match.group(1)), material
+            )
+        if thickness is None:
+            gauge_match = _GAUGE_PATTERN.search(body)
+            if gauge_match is not None:
+                thickness = snap_thickness(
+                    _gauge_to_inches(int(gauge_match.group(1)), material), material
+                )
 
     return EmailHints(
         material=material,

@@ -996,6 +996,32 @@ def test_files_already_on_the_shared_drive_are_referenced_not_copied(
     assert sorted(p.name for p in shared.iterdir()) == ["Panel.dxf", "Panel.pdf"]
 
 
+def test_the_email_reads_gauges_the_way_the_drawing_and_print_already_did() -> None:
+    """An email is where shop shorthand shows up, and it was the one source
+    that could not read a gauge. The number means different thicknesses in
+    different metals, so it is only read once a material is known."""
+    steel = job_intake_service.extract_email_hints("make these in 11ga mild steel-a36")
+    assert steel.material == "Mild Steel-A36"
+    assert steel.thickness == 0.12, "11GA steel is .118 nominal, .12 for CAM"
+
+    aluminium = job_intake_service.extract_email_hints("11 GA aluminum 5052 please")
+    assert aluminium.thickness == 0.09, "the same gauge is a different thickness in aluminium"
+
+    # An explicit measurement still wins over a gauge in the same message.
+    assert job_intake_service.extract_email_hints(
+        "1/4 THK aluminum 5052"
+    ).thickness == 0.25
+
+    # A gauge the shop does not stock resolves to nothing rather than to a
+    # nearby value - the catalog is the authority for what exists.
+    assert job_intake_service.extract_email_hints(
+        "16GA mild steel-a36"
+    ).thickness is None
+
+    # And a gauge with no material named stays unread; 11GA is not one number.
+    assert job_intake_service.extract_email_hints("make these 11ga").thickness is None
+
+
 def test_a_thickness_stated_in_the_email_is_used_when_nothing_else_says(
     tmp_path, monkeypatch, shop_csvs
 ) -> None:
