@@ -577,6 +577,37 @@ def test_dxf_hints_reject_a_thickness_the_shop_does_not_stock(tmp_path, shop_csv
     assert hints.thickness is None
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["VALUE", "ASSEMBLY", "ITEMS", "TOTAL VALUE", "SEE ASSEMBLY DRAWING", "ASSY"],
+)
+def test_ordinary_words_do_not_predict_a_material(text, shop_csvs) -> None:
+    """Aliases were matched as bare substrings, so VALUE contained "alu",
+    ASSEMBLY contained "ss" and ITEMS contained "ms". Since the email body is
+    scraped, that was ordinary prose deciding what gets cut."""
+    assert job_intake_service._match_material_in_text(text) is None
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("MATL: ALUM", "Aluminum 5052"),
+        ("5052 ALUM", "Aluminum 5052"),
+        ("cold rolled steel", "Mild Steel-A36"),
+        ("MILD STEEL", "Mild Steel-A36"),
+        ("MATL: CRS", "Mild Steel-A36"),
+        ("44W", "Mild Steel-A36"),
+        ("A-36", "Mild Steel-A36"),
+        ("304 SS", "Stainless Steel"),
+        ("checker plate", "Aluminum 3003 CHK"),
+    ],
+)
+def test_real_material_wording_still_resolves(text, expected) -> None:
+    """The word-boundary fix must not cost the multiword aliases - "cold
+    rolled" and "checker plate" have to match a run of tokens."""
+    assert job_intake_service._match_material_in_text(text) == expected
+
+
 def test_a_bare_dimension_is_not_mistaken_for_a_material(tmp_path, monkeypatch) -> None:
     """Regression: the real shop file contains `5052 H32 >80"`, whose "80" was
     harvested as an Aluminum token - so any 80mm dimension on a drawing
@@ -661,9 +692,42 @@ def test_drawing_qty_used_when_there_is_no_po(tmp_path, monkeypatch, shop_csvs) 
     assert part["strategy"] == "Air"
 
 
-def test_material_choices_falls_back_when_rules_missing(tmp_path: Path, monkeypatch) -> None:
+def test_a_missing_catalog_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    """description_rules.csv is the authority for what exists, and it lives on
+    C: - unreachable means something is badly wrong. Falling back to a
+    hardcoded list would quietly make a stale guess the authority for what gets
+    cut, so nothing is offered and the import refuses."""
     monkeypatch.setattr(job_intake_service, "INVENTOR_TO_RADAN_DIR", tmp_path / "missing")
-    assert material_choices() == job_intake_service.FALLBACK_MATERIALS
+
+    assert material_choices() == ()
+    assert job_intake_service.thickness_choices("Aluminum 5052") == ()
+
+    # And the gate refuses rather than letting a previously-filled row through.
+    entry = _entry_with_parts(tmp_path)
+    with pytest.raises(JobIntakeError) as excinfo:
+        build_import_csv_rows(entry)
+    assert "catalog" in str(excinfo.value).casefold()
+
+
+def test_import_refuses_a_material_thickness_pair_the_catalog_lacks(
+    tmp_path: Path, shop_csvs
+) -> None:
+    """The last check before anything is written for RADAN, against the catalog
+    as it reads now - the file may have changed since the job was filed."""
+    entry = _entry_with_parts(tmp_path)
+    part = entry["material_qty"][0]
+    part["material"] = "Aluminum 5052"
+    part["thickness"] = 0.9  # not stocked
+    part["resolved"] = {"material": True}
+
+    with pytest.raises(JobIntakeError) as excinfo:
+        build_import_csv_rows(entry)
+    assert "isn't stocked" in str(excinfo.value)
+
+    part["material"] = "Unobtainium"
+    with pytest.raises(JobIntakeError) as excinfo:
+        build_import_csv_rows(entry)
+    assert "not in the shop's material list" in str(excinfo.value)
 
 
 def test_default_strategy_for_material() -> None:

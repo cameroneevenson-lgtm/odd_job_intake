@@ -632,11 +632,12 @@ def complete_intake(
         # The BOM wins: its description is the shop's own string, not a
         # customer's wording that had to be interpreted.
         bom_row = bom_rows.get(Path(name).stem)
-        bom_material = bom_thickness = None
+        bom_material = bom_thickness = bom_strategy = None
         if bom_row is not None and bom_row.material:
             if bom_row.material in available_materials:
                 bom_material = bom_row.material
                 bom_thickness = bom_row.thickness
+                bom_strategy = bom_row.strategy
             else:
                 note = (
                     f"{name}: the BOM asks for {bom_row.material} "
@@ -797,8 +798,17 @@ def complete_intake(
                 "material": material or "",
                 "thickness": thickness or 0.0,
                 "qty": int(resolved_qty or 1),
-                "unit": "in",
-                "strategy": default_strategy_for_material(material) if material else "",
+                "unit": (cam_row["unit"] if cam_row else None) or "in",
+                # The CAM row's own strategy, verbatim - casing included. It is
+                # the converter's answer for that exact description, and
+                # recomputing it from material alone threw away the one source
+                # that had already decided. Only derived when nothing
+                # authoritative said.
+                "strategy": (
+                    (cam_row["strategy"] if cam_row else None)
+                    or (bom_strategy if bom_material else None)
+                    or (default_strategy_for_material(material) if material else "")
+                ),
                 "po_ref": str(hint.get("raw_description", "") or ""),
                 # Shown as reference so the user can see what the drawing said,
                 # the same way po_ref shows what the PO said.
@@ -1233,9 +1243,12 @@ def material_thickness_catalog() -> dict[str, tuple[float, ...]]:
         best = max(spellings[key].items(), key=lambda pair: pair[1])[0]
         catalog[best] = thicknesses
 
-    if not catalog:
-        # The files are missing or reshaped; fall back so intake still works.
-        return {material: () for material in FALLBACK_MATERIALS}
+    # No fallback. An empty catalog means description_rules.csv is missing or
+    # reshaped, and it lives on C: - unreachable means something is badly
+    # wrong. Substituting a hardcoded list would quietly make a stale guess the
+    # authority for what gets cut, which is exactly what this file exists to
+    # prevent. Callers predict nothing and the import refuses; the folder and
+    # the files are still created, so no work is lost.
     return {
         material: tuple(sorted(thicknesses))
         for material, thicknesses in sorted(catalog.items(), key=lambda pair: pair[0].casefold())
@@ -1592,10 +1605,13 @@ def _read_material_aliases() -> dict[str, str]:
     try:
         with _material_aliases_path().open(newline="", encoding="utf-8-sig") as handle:
             for row in csv.DictReader(handle):
-                alias = _normalize_match_key(row.get("Alias", ""))
+                # Kept as written, not normalised: matching is done on word
+                # boundaries, and normalising "cold rolled" to "coldrolled"
+                # would destroy the token boundary that makes that safe.
+                alias = str(row.get("Alias", "") or "").strip()
                 material = str(row.get("Material", "") or "").strip()
                 if alias and material:
-                    aliases[alias] = material
+                    aliases[alias.casefold()] = material
     except OSError:
         return {}
     return aliases
@@ -1892,11 +1908,27 @@ def _match_material_in_text(text: str) -> str | None:
     available = set(material_choices())
     matches: set[str] = set()
 
-    # Aliases are matched as normalised phrases so multi-word entries
-    # ("cold rolled", "checker plate") work, not just single tokens.
-    haystack = _normalize_match_key(raw)
+    # Matched on word boundaries, never as bare substrings. Substring matching
+    # meant ordinary words predicted materials - VALUE contains "alu",
+    # ASSEMBLY contains "ss", ITEMS contains "ms" - and since the email body is
+    # scraped, that was ordinary prose deciding what gets cut.
+    #
+    # Single-word aliases must match a whole token; multiword aliases must
+    # match a run of consecutive tokens ("cold rolled", "checker plate").
+    tokens = [word.casefold() for word in re.findall(r"[A-Za-z0-9]+", raw)]
     for alias, material in _read_material_aliases().items():
-        if alias and alias in haystack and material in available:
+        if not alias or material not in available:
+            continue
+        alias_tokens = [
+            word.casefold() for word in re.findall(r"[A-Za-z0-9]+", alias)
+        ]
+        if not alias_tokens:
+            continue
+        span = len(alias_tokens)
+        if any(
+            tokens[index : index + span] == alias_tokens
+            for index in range(len(tokens) - span + 1)
+        ):
             matches.add(material)
 
     words = {word.casefold() for word in re.findall(r"[A-Za-z0-9]+", raw)}
@@ -2572,6 +2604,9 @@ class BomRow:
     qty: int | None
     material: str | None
     thickness: float | None
+    # Carried from the rules table when the description matched verbatim, so a
+    # BOM line's own strategy is used rather than one derived from material.
+    strategy: str | None = None
 
 
 def _looks_like_bom(lines: list[str]) -> bool:
@@ -2620,11 +2655,12 @@ def extract_bom_rows(pdf_path: Path, part_stems: list[str]) -> dict[str, BomRow]
             if 0 < candidate <= 9999:
                 qty = candidate
 
-        material = thickness = None
+        material = thickness = strategy = None
         rule = rules.get(_normalize_match_key(description))
         if rule is not None:
             material = str(rule["material"])
             thickness = float(rule["thickness"])
+            strategy = str(rule.get("strategy", "") or "") or None
         else:
             # Not a verbatim description - fall back to the usual flattening.
             material = _match_material_in_text(description)
@@ -2635,6 +2671,7 @@ def extract_bom_rows(pdf_path: Path, part_stems: list[str]) -> dict[str, BomRow]
             qty=qty,
             material=material,
             thickness=thickness,
+            strategy=strategy,
         )
     return rows
 
@@ -2649,6 +2686,19 @@ def build_import_csv_rows(entry: dict[str, Any]) -> list[list[str]]:
         str(attachment.get("filename", "")): str(attachment.get("saved_path", ""))
         for attachment in entry.get("attachments", [])
     }
+    # Loaded once, here, immediately before anything is written for RADAN. The
+    # catalog is the authority for what exists, so this is where that is
+    # actually enforced rather than assumed from whatever the rows were given
+    # when the job was filed - the file may have changed since.
+    catalog = material_thickness_catalog()
+    if not catalog:
+        raise JobIntakeError(
+            "The shop's material catalog could not be read "
+            f"({_description_rules_path()}), so nothing can be validated "
+            "against it. Nothing has been imported. Check that the file is "
+            "readable, then try again."
+        )
+
     rows: list[list[str]] = []
     problems: list[str] = []
     for part in entry.get("material_qty", []):
@@ -2714,6 +2764,22 @@ def build_import_csv_rows(entry: dict[str, Any]) -> list[list[str]]:
                 f"quantity, the 1 shown is a placeholder"
             )
             continue
+        # The final tuple has to exist in the catalog as loaded right now.
+        # Everything upstream is a route into that file; this is the gate that
+        # makes it true rather than intended.
+        if material not in catalog:
+            problems.append(
+                f"{filename}: {material!r} is not in the shop's material list"
+            )
+            continue
+        if thickness not in catalog[material]:
+            available = ", ".join(f"{value:g}" for value in catalog[material]) or "none"
+            problems.append(
+                f"{filename}: {material} isn't stocked at {thickness:g} "
+                f"(available: {available})"
+            )
+            continue
+
         unit = str(part.get("unit", "") or "in").strip().casefold()
         strategy = str(part.get("strategy", "") or "").strip() or default_strategy_for_material(material)
         rows.append([saved_path, str(qty), material, str(thickness), unit, strategy])
