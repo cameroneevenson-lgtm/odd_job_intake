@@ -2318,24 +2318,43 @@ _ALL_LABEL_WORDS = frozenset(
 )
 
 
-def _page_names_part(words: list[tuple], cells: dict[str, str], wanted: str) -> bool:
+def _page_names_part(
+    words: list[tuple], cells: dict[str, str], wanted: str, raw_stem: str = ""
+) -> bool:
     """Whether this page is about `wanted` (already normalised).
 
     Prefers the title block's drawing-number cell, but falls back to the part
-    number appearing anywhere on the page. Prints are routinely named and
-    numbered by the customer's own system rather than after the part file, and
-    in that case the part number still shows up somewhere on the sheet - so
-    refusing to look outside the title block would reject the whole drawing.
+    number appearing on the page. Prints are routinely named and numbered by
+    the customer's own system rather than after the part file, and in that case
+    the part number still shows up somewhere on the sheet - so refusing to look
+    outside the title block would reject the whole drawing.
+
+    Both checks are boundary-aware. Normalising strips the separators, so
+    "F59487-1" becomes "f594871", which is a *prefix* of "f5948710" - a plain
+    substring test therefore lets part 1's drawing claim parts 10 through 19.
+    Today the caller tries the identically-named PDF first, so that never
+    surfaces; it would the moment a part arrives without a print of its own and
+    a lower-numbered sibling has one.
     """
     if not wanted:
         return True
 
     stated = _normalize_match_key(cells.get("part", ""))
-    if stated and (wanted in stated or stated in wanted):
-        return True
+    if stated:
+        # Exact only. A drawing that names its part names it exactly; anything
+        # looser is this page claiming a part it does not describe.
+        if stated == wanted:
+            return True
 
-    anywhere = _normalize_match_key(" ".join(str(word[4]) for word in words))
-    return wanted in anywhere
+    # Fall back to the raw page text, where the separators still exist and can
+    # act as the boundary the normalised form threw away.
+    needle = str(raw_stem or "").strip()
+    if not needle:
+        return False
+    page_text = " ".join(str(word[4]) for word in words)
+    return (
+        re.search(rf"(?<![0-9A-Za-z]){re.escape(needle)}(?![0-9A-Za-z])", page_text) is not None
+    )
 
 
 def _print_words(pdf_path: Path) -> list[list[tuple]]:
@@ -2446,7 +2465,7 @@ def extract_print_hints(pdf_path: Path, part_stem: str | None = None) -> PrintHi
         if not cells:
             continue
 
-        if not _page_names_part(words, cells, wanted):
+        if not _page_names_part(words, cells, wanted, str(part_stem or "")):
             continue
 
         if material is None and cells.get("material"):

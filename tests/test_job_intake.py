@@ -996,6 +996,48 @@ def test_files_already_on_the_shared_drive_are_referenced_not_copied(
     assert sorted(p.name for p in shared.iterdir()) == ["Panel.dxf", "Panel.pdf"]
 
 
+def _word(text: str) -> tuple:
+    """A PyMuPDF word box; only the text matters for these."""
+    return (0.0, 0.0, 10.0, 10.0, text)
+
+
+def test_a_drawing_does_not_claim_the_parts_whose_number_it_is_a_prefix_of() -> None:
+    """Normalising strips the separators, so "F59487-1" becomes "f594871" -
+    which is a prefix of "f5948710". A plain substring test let part 1's
+    drawing claim parts 10 through 19 and hand them its material.
+
+    Masked in production because the identically-named PDF is tried first, so
+    it would have surfaced the first time a part arrived without a print of its
+    own while a lower-numbered sibling had one.
+    """
+    words = [_word("F59487-1"), _word("BRACKET")]
+    cells = {"part": "F59487-1"}
+
+    assert job_intake_service._page_names_part(
+        words, cells, job_intake_service._normalize_match_key("F59487-1"), "F59487-1"
+    )
+    for other in ("F59487-10", "F59487-11", "F59487-13", "F59487-19"):
+        assert not job_intake_service._page_names_part(
+            words, cells, job_intake_service._normalize_match_key(other), other
+        ), f"part 1's drawing claimed {other}"
+
+
+def test_a_print_numbered_by_the_customer_still_matches_on_the_page_text() -> None:
+    """The reason the fallback exists: prints are routinely numbered by the
+    customer's own system, and the part number then appears elsewhere on the
+    sheet rather than in the drawing-number cell."""
+    words = [_word("CUST-DWG-7741"), _word("FOR"), _word("PART"), _word("F59487-3")]
+    cells = {"part": "CUST-DWG-7741"}
+
+    assert job_intake_service._page_names_part(
+        words, cells, job_intake_service._normalize_match_key("F59487-3"), "F59487-3"
+    )
+    # ...and the boundary still holds on that path.
+    assert not job_intake_service._page_names_part(
+        words, cells, job_intake_service._normalize_match_key("F59487-30"), "F59487-30"
+    )
+
+
 def test_the_email_reads_gauges_the_way_the_drawing_and_print_already_did() -> None:
     """An email is where shop shorthand shows up, and it was the one source
     that could not read a gauge. The number means different thicknesses in
