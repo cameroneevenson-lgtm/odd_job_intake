@@ -996,6 +996,67 @@ def test_files_already_on_the_shared_drive_are_referenced_not_copied(
     assert sorted(p.name for p in shared.iterdir()) == ["Panel.dxf", "Panel.pdf"]
 
 
+def test_a_thickness_stated_in_the_email_is_used_when_nothing_else_says(
+    tmp_path, monkeypatch, shop_csvs
+) -> None:
+    """It was extracted and then referenced nowhere.
+
+    A source that is read but never consulted is worse than one that isn't read
+    at all: the comment said it existed so it could dispute the others, so it
+    looked handled.
+    """
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    monkeypatch.setattr(
+        job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
+    )
+    monkeypatch.setattr(
+        job_intake_service, "MATERIAL_MEMORY_PATH", tmp_path / "fingerprints.json"
+    )
+    # The drawing names the material but no thickness - the common case.
+    dxf = _dxf_with_text(tmp_path / "Bracket.dxf", "MATERIAL: ALUMINUM 5052")
+
+    entry = job_intake_service.create_intake(
+        "M50960", None, [dxf], email_body="please cut these in 1/4 THK aluminum 5052"
+    )
+
+    part = entry["material_qty"][0]
+    assert part["material"] == "Aluminum 5052"
+    assert part["thickness"] == 0.25, "the email's thickness was ignored"
+
+
+def test_a_thickness_the_email_and_the_drawing_disagree_on_is_a_conflict(
+    tmp_path, monkeypatch, shop_csvs
+) -> None:
+    """Every source that can choose a value must also be able to argue about
+    it. Letting the email win silently is the same failure as letting any other
+    source win silently - the metal gets cut either way."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    monkeypatch.setattr(
+        job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
+    )
+    monkeypatch.setattr(
+        job_intake_service, "MATERIAL_MEMORY_PATH", tmp_path / "fingerprints.json"
+    )
+    dxf = _dxf_with_text(
+        tmp_path / "Bracket.dxf", "MATERIAL: ALUMINUM 5052", ".125 THK"
+    )
+
+    entry = job_intake_service.create_intake(
+        "M50961", None, [dxf], email_body="cut these in 1/4 THK aluminum 5052"
+    )
+
+    part = entry["material_qty"][0]
+    assert part["conflicts"].get("thickness"), "the disagreement went unnoticed"
+    assert "the email" in part["conflicts"]["thickness"]
+
+    # And it stops the import until someone settles it.
+    part["material_confirmed"] = True
+    part["qty_unknown"] = False
+    with pytest.raises(JobIntakeError) as excinfo:
+        build_import_csv_rows(entry)
+    assert "thickness" in str(excinfo.value)
+
+
 def test_an_email_may_only_pull_from_the_shops_own_shares(
     tmp_path, monkeypatch, shop_csvs
 ) -> None:

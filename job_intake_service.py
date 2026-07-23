@@ -795,9 +795,13 @@ def complete_intake(
             or print_hints.material
             or dxf_hints.material
         )
+        # Same precedence the material above uses, for the same reason: someone
+        # typed it deliberately for this job, which outranks a drawing note but
+        # not structured CAM output.
         thickness = (
             (cam_row["thickness"] if cam_row else None)
             or bom_thickness
+            or email_hints.thickness
             or print_hints.thickness
             or dxf_hints.thickness
         )
@@ -846,6 +850,7 @@ def complete_intake(
         thickness_stated = {
             "the CAM BOM": cam_row["thickness"] if cam_row else None,
             "the BOM": bom_thickness,
+            "the email": email_hints.thickness,
             "the print": print_hints.thickness,
             "the drawing": dxf_hints.thickness,
         }
