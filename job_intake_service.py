@@ -358,14 +358,38 @@ def create_intake(
     # A spreadsheet BOM outranks everything: it is structured CAM output, and
     # inventor_to_radan converts it with the shop's own rules rather than
     # anything guessed here.
+    # Warnings this code raises, kept apart from `unmatched` - which holds PO
+    # lines that matched nothing and gets noise-filtered below. Mixing them let
+    # that filter silently eat real warnings twice, because a message about a
+    # BOM naturally contains the word "BOM". They are merged at the end.
+    notes: list[str] = []
+
     cam_rows: dict[str, dict[str, Any]] = {}
     for filename, path in attachment_paths.items():
         if path.suffix.casefold() not in BOM_SPREADSHEET_SUFFIXES:
             continue
         if not _looks_like_bom_spreadsheet(path):
             continue
-        for row in convert_bom_spreadsheet(path):
+        conversion = convert_bom_spreadsheet(path)
+        for row in conversion.rows:
             cam_rows[Path(str(row["filename"])).stem.casefold()] = row
+
+        # inventor_to_radan's own accountability checks, passed straight
+        # through. It runs these as part of converting, so reporting what it
+        # found beats re-deriving them here and disagreeing later.
+        for orphan in conversion.orphan_dxfs:
+            notes.append(
+                f"{orphan}: in the folder but not referenced by the BOM "
+                f"(inventor_to_radan). Check with engineering - there may be a "
+                f"reason, or the BOM may have missed it."
+            )
+        for missing in conversion.expected_missing_dxfs:
+            notes.append(
+                f"{missing}: expected by the BOM but no DXF was found "
+                f"(inventor_to_radan)."
+            )
+        for missing_pdf in conversion.missing_pdfs:
+            notes.append(f"{missing_pdf}: no PDF alongside it (inventor_to_radan).")
         if cam_rows:
             break
 
@@ -443,25 +467,24 @@ def create_intake(
                     f"{name}: the BOM asks for {bom_row.material} "
                     f'("{bom_row.description}"), which isn\'t in the shop\'s laser list'
                 )
-                if note not in unmatched:
-                    unmatched.append(note)
+                if note not in notes:
+                    notes.append(note)
 
         # Order of trust, most structured first: a BOM states it in the shop's
         # own words; the email was typed for this job but in prose; a print's
         # title block is a drawing note; the DXF's own text is the last resort.
         cam_row = cam_rows.get(Path(name).stem.casefold())
 
-        # A DXF the parts list doesn't mention. There may be a good reason for
-        # it or it may be a mistake, but either way it is a question for
-        # engineering rather than something to resolve from the drawing - so it
-        # is named rather than quietly filled in from the print.
-        if (cam_rows or bom_rows) and cam_row is None and Path(name).stem not in bom_rows:
+        # A DXF the PDF parts list doesn't mention. Only checked here for a PDF
+        # BOM - a spreadsheet one goes through inventor_to_radan, whose own
+        # orphan-DXF check is reported above rather than duplicated.
+        if bom_rows and not cam_rows and Path(name).stem not in bom_rows:
             note = (
                 f"{name}: this DXF isn't in the BOM. Check with engineering - "
                 f"there may be a reason, or the BOM may have missed it."
             )
-            if note not in unmatched:
-                unmatched.append(note)
+            if note not in notes:
+                notes.append(note)
         material = (
             (cam_row["material"] if cam_row else None)
             or bom_material
@@ -509,8 +532,8 @@ def create_intake(
             detail = ", ".join(f"{where} says {value}" for where, value in named.items())
             source_conflict = f"material - {detail}"
             note = f"{name}: sources disagree on material - {detail}"
-            if note not in unmatched:
-                unmatched.append(note)
+            if note not in notes:
+                notes.append(note)
 
         # A print that names a material/thickness the catalog doesn't list is
         # worth saying out loud - it usually means the shop's own CSV hasn't
@@ -524,8 +547,8 @@ def create_intake(
                 f"{name}: the print asks for {print_hints.thickness_source_text} "
                 f"{print_hints.material}, which isn't in the shop's laser list"
             )
-            if note not in unmatched:
-                unmatched.append(note)
+            if note not in notes:
+                notes.append(note)
 
         # Quantity precedence: the PO is a commitment, the print is a drawing
         # note. Neither may be invented - a blank QTY or a "REFER TO BOM" is
@@ -556,8 +579,8 @@ def create_intake(
                 else f"quantity - {detail}"
             )
             note = f"{name}: sources disagree on quantity - {detail}"
-            if note not in unmatched:
-                unmatched.append(note)
+            if note not in notes:
+                notes.append(note)
 
         material_qty.append(
             {
@@ -618,6 +641,10 @@ def create_intake(
 
     # Flagged so it's obvious in the queue that this job is still waiting for
     # its real number, rather than looking like any other filed job.
+    # PO leftovers first, then everything this code flagged. Kept separate all
+    # the way to here so the noise filter above can never reach the warnings.
+    unmatched = unmatched + [note for note in notes if note not in unmatched]
+
     entry["provisional"] = is_placeholder_job_number(job_number)
     entry["ingested_from"] = ingested_from
     entry["source_paths"] = [
@@ -2080,20 +2107,36 @@ def _looks_like_bom_spreadsheet(path: Path) -> bool:
     )
 
 
-def convert_bom_spreadsheet(bom_path: Path) -> list[dict[str, Any]]:
-    """Hand a spreadsheet BOM to inventor_to_radan and read back its rows.
+@dataclass(frozen=True)
+class BomConversion:
+    """What inventor_to_radan produced, and what it noticed while doing it."""
 
-    Returns [{filename, qty, material, thickness, unit, strategy}], or [] when
-    the conversion couldn't run. Never raises for a BOM that simply doesn't
-    convert - intake continues on the scraped sources instead.
+    rows: tuple[dict[str, Any], ...] = ()
+    # Its own accountability checks, reported rather than recomputed here.
+    orphan_dxfs: tuple[str, ...] = ()          # in the folder, not in the BOM
+    expected_missing_dxfs: tuple[str, ...] = ()  # in the BOM, no DXF found
+    missing_pdfs: tuple[str, ...] = ()
+    nonlaser_parts: tuple[str, ...] = ()
+
+
+def convert_bom_spreadsheet(bom_path: Path) -> BomConversion:
+    """Hand a spreadsheet BOM to inventor_to_radan and read back what it made.
+
+    Returns its rows plus its own findings. Those findings are taken from the
+    result object rather than recomputed here: it already checks DXF
+    accountability as part of converting, and a second implementation would
+    only be a second thing to disagree.
+
+    Never raises for a BOM that simply doesn't convert - intake continues on
+    the scraped sources instead.
     """
     bom_path = Path(bom_path)
     if not bom_path.exists():
-        return []
+        return BomConversion()
 
     try:
         runner = _load_inventor_to_radan()
-        runner.run_inline(
+        result = runner.run_inline(
             INVENTOR_TO_RADAN_DIR / "inventor_to_radan.py",
             bom_path,
             allow_prompts=False,
@@ -2102,11 +2145,20 @@ def convert_bom_spreadsheet(bom_path: Path) -> list[dict[str, Any]]:
     except Exception:
         # Includes InventorToRadanNeedsUi / Cancelled / ReportRejected, which
         # are the documented outcomes when it needs a human and can't have one.
-        return []
+        return BomConversion()
 
-    output = bom_path.with_name(f"{bom_path.stem}{RADAN_OUTPUT_SUFFIX}")
+    findings = {
+        "orphan_dxfs": tuple(getattr(result, "orphan_dxfs", ()) or ()),
+        "expected_missing_dxfs": tuple(getattr(result, "expected_missing_dxfs", ()) or ()),
+        "missing_pdfs": tuple(getattr(result, "missing_pdfs", ()) or ()),
+        "nonlaser_parts": tuple(getattr(result, "nonlaser_parts", ()) or ()),
+    }
+
+    output = Path(getattr(result, "out_path", "") or "") or bom_path.with_name(
+        f"{bom_path.stem}{RADAN_OUTPUT_SUFFIX}"
+    )
     if not output.exists():
-        return []
+        return BomConversion(**findings)
 
     rows: list[dict[str, Any]] = []
     try:
@@ -2132,8 +2184,8 @@ def convert_bom_spreadsheet(bom_path: Path) -> list[dict[str, Any]]:
                     }
                 )
     except OSError:
-        return []
-    return rows
+        return BomConversion(**findings)
+    return BomConversion(rows=tuple(rows), **findings)
 
 
 def apply_cam_bom(entry: dict[str, Any]) -> tuple[int, str]:
@@ -2163,9 +2215,14 @@ def apply_cam_bom(entry: dict[str, Any]) -> tuple[int, str]:
         return 0, "No spreadsheet BOM (.csv/.xlsx) is attached to this job."
 
     rows: dict[str, dict[str, Any]] = {}
+    notes: list[str] = []
     for candidate in candidates:
-        for row in convert_bom_spreadsheet(candidate):
+        conversion = convert_bom_spreadsheet(candidate)
+        for row in conversion.rows:
             rows[Path(str(row["filename"])).stem.casefold()] = row
+        notes.extend(
+            f"{orphan}: in the folder but not in the BOM" for orphan in conversion.orphan_dxfs
+        )
         if rows:
             break
     if not rows:
@@ -2197,6 +2254,8 @@ def apply_cam_bom(entry: dict[str, Any]) -> tuple[int, str]:
     message = f"BOM applied to {updated} part(s)."
     if unmatched:
         message += " Not in the BOM: " + ", ".join(unmatched)
+    if notes:
+        message += " " + "; ".join(notes)
     return updated, message
 
 
