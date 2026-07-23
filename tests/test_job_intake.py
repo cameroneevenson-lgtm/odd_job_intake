@@ -1068,6 +1068,125 @@ def test_radan_import_refuses_while_radan_is_open_or_already_importing(tmp_path,
     job_intake_service.assert_radan_is_safe_to_drive(SimpleNamespace(), paths)
 
 
+# --- BOM conversion outcomes -------------------------------------------------
+
+
+def _bom(tmp_path: Path, name: str = "BOM.csv") -> Path:
+    """A file that _looks_like_bom_spreadsheet accepts."""
+    path = tmp_path / name
+    path.write_text("Part Number,Description,QTY\nA-1,PLATE 11GA,2\n", encoding="utf-8")
+    return path
+
+
+class InventorToRadanNeedsUi(RuntimeError):
+    """Stands in for inventor_to_radan's own class of the same name.
+
+    Deliberately defined here rather than imported: inline_runner execs that
+    module under a private name and drops it again, so the class the converter
+    actually raises is rebuilt on every call and is never the one this process
+    would import. A same-named local class is therefore the faithful stand-in -
+    and it is what catches a classifier written with isinstance, which would
+    silently never match in production.
+    """
+
+    def __init__(self, missing_rules=(), missing_dxf_items=()):
+        self.missing_rules = list(missing_rules)
+        self.missing_dxf_items = list(missing_dxf_items)
+        super().__init__("needs input")
+
+
+def _runner_raising(exc: Exception):
+    from types import SimpleNamespace
+
+    def run_inline(*args, **kwargs):
+        raise exc
+
+    return SimpleNamespace(run_inline=run_inline)
+
+
+def test_a_bom_needing_a_rule_is_named_and_blocks(tmp_path: Path, monkeypatch) -> None:
+    """A missing CAM rule is recoverable in one specific way, so say which way.
+
+    The old blanket handler returned an empty result, which was indistinguishable
+    from "the BOM had no rows" - so the job carried on against the scraped
+    prints, quietly demoting its own source of truth to a guess.
+    """
+    monkeypatch.setattr(
+        job_intake_service,
+        "_load_inventor_to_radan",
+        lambda: _runner_raising(InventorToRadanNeedsUi(missing_rules=["PLATE 11GA", "TUBE 2X2"])),
+    )
+    conversion = job_intake_service.convert_bom_spreadsheet(_bom(tmp_path))
+
+    assert conversion.outcome == job_intake_service.BOM_NEEDS_RULES
+    assert conversion.blocked
+    assert conversion.rows == ()
+    # Names the descriptions and the way the shop adds a rule.
+    assert "PLATE 11GA" in conversion.reason
+    assert "inventor_to_radan" in conversion.reason
+
+
+def test_a_bom_needing_a_dxf_classified_is_distinguished_from_one_needing_a_rule(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        job_intake_service,
+        "_load_inventor_to_radan",
+        lambda: _runner_raising(InventorToRadanNeedsUi(missing_dxf_items=[{"part": "A-1"}])),
+    )
+    conversion = job_intake_service.convert_bom_spreadsheet(_bom(tmp_path))
+
+    assert conversion.outcome == job_intake_service.BOM_NEEDS_DXF_CLASSIFICATION
+    assert conversion.blocked
+
+
+@pytest.mark.parametrize(
+    "exc, expected",
+    [
+        (ImportError("pandas is not installed"), "converter_unavailable"),
+        (ValueError("no header row"), "unexpected_failure"),
+    ],
+    ids=["missing-dependency", "anything-else"],
+)
+def test_other_converter_failures_are_typed_rather_than_swallowed(
+    tmp_path: Path, monkeypatch, exc, expected
+) -> None:
+    monkeypatch.setattr(
+        job_intake_service, "_load_inventor_to_radan", lambda: _runner_raising(exc)
+    )
+    conversion = job_intake_service.convert_bom_spreadsheet(_bom(tmp_path))
+    assert conversion.outcome == expected
+    assert conversion.blocked
+    assert str(exc) in conversion.reason
+
+
+def test_a_missing_bom_is_not_a_failure(tmp_path: Path) -> None:
+    """Nothing to convert is the ordinary case for a job filed from DXFs alone,
+    and must not be confused with a BOM that would not convert."""
+    conversion = job_intake_service.convert_bom_spreadsheet(tmp_path / "nope.csv")
+    assert conversion.outcome == job_intake_service.BOM_NOT_ATTEMPTED
+    assert not conversion.blocked
+
+
+def test_a_bom_that_would_not_convert_blocks_the_import(tmp_path: Path) -> None:
+    """The whole point of typing the outcome: the gate refuses, and says why."""
+    entry = _entry_with_parts(tmp_path)
+    entry["bom_blockers"] = [
+        "BOM.csv uses 2 description(s) with no RADAN rule yet: PLATE 11GA, TUBE 2X2."
+    ]
+
+    with pytest.raises(JobIntakeError) as excinfo:
+        build_import_csv_rows(entry)
+    message = str(excinfo.value)
+    assert "STOP" in message
+    assert "PLATE 11GA" in message
+    assert "Nothing has been imported" in message
+
+    # Cleared once the BOM converts, which is what re-applying it does.
+    entry["bom_blockers"] = []
+    assert len(build_import_csv_rows(entry)) == 1
+
+
 def test_conflicting_sources_are_a_hard_stop(tmp_path: Path) -> None:
     """Two sources giving different answers isn't a note to read past. Whoever
     asked for the job has to say which is right - ranking one source over the

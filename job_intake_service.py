@@ -540,12 +540,25 @@ def complete_intake(
     notes: list[str] = []
 
     cam_rows: dict[str, dict[str, Any]] = {}
+    # Spreadsheet BOMs that were recognised but could not be converted. Carried
+    # onto the entry so the import gate can refuse rather than proceed on the
+    # scraped sources.
+    bom_blockers: list[str] = []
     for filename, path in attachment_paths.items():
         if path.suffix.casefold() not in BOM_SPREADSHEET_SUFFIXES:
             continue
         if not _looks_like_bom_spreadsheet(path):
             continue
         conversion = convert_bom_spreadsheet(path, move_output_to=paths.intake_dir)
+        # A spreadsheet BOM is the authority for this job. If it exists but
+        # could not be read, the scraped prints are not a substitute for it -
+        # falling through to them would quietly downgrade the source of truth
+        # to a guess. Recorded so the gate refuses the import and says why.
+        if conversion.blocked:
+            bom_blockers.append(conversion.reason)
+            notes.append(f"STOP: {conversion.reason}")
+            continue
+
         for row in conversion.rows:
             cam_rows[Path(str(row["filename"])).stem.casefold()] = row
 
@@ -879,6 +892,7 @@ def complete_intake(
     entry["attachments"] = attachments
     entry["material_qty"] = material_qty
     entry["po_unmatched"] = unmatched
+    entry["bom_blockers"] = bom_blockers
     if entry_rpd_path:
         entry["rpd_path"] = entry_rpd_path
         entry["status"] = job_intake_registry.STATUS_RPD_CREATED
@@ -901,8 +915,8 @@ def complete_intake(
             for field in (
                 "provisional", "ingested_from", "source_paths", "job_folder",
                 "po_number", "due_date", "due_note", "attachments",
-                "material_qty", "po_unmatched", "email_body", "status",
-                "rpd_path", "error", "complete", "state",
+                "material_qty", "po_unmatched", "bom_blockers", "email_body",
+                "status", "rpd_path", "error", "complete", "state",
             )
             if field in entry
         },
@@ -2396,6 +2410,30 @@ def _looks_like_bom_spreadsheet(path: Path) -> bool:
     )
 
 
+# Why a conversion ended the way it did. The blanket "return an empty
+# BomConversion" this replaces made a converter that refused to run look
+# exactly like a BOM with nothing in it, so a job whose authority was
+# unreadable quietly fell through to the scraped sources instead of stopping.
+BOM_CONVERTED = "converted"
+BOM_NOT_ATTEMPTED = "not_attempted"          # no spreadsheet to convert
+BOM_NEEDS_RULES = "needs_rules"              # a description has no CAM rule yet
+BOM_NEEDS_DXF_CLASSIFICATION = "needs_missing_dxf_classification"
+BOM_INVALID = "invalid_bom"                  # recognised, but unreadable
+BOM_CONVERTER_UNAVAILABLE = "converter_unavailable"
+BOM_UNEXPECTED_FAILURE = "unexpected_failure"
+
+# Everything except a clean conversion and "there was no BOM". A spreadsheet
+# BOM is the authority for this job, so failing to read one is a stop, not a
+# reason to guess from the prints.
+BOM_BLOCKING_OUTCOMES = (
+    BOM_NEEDS_RULES,
+    BOM_NEEDS_DXF_CLASSIFICATION,
+    BOM_INVALID,
+    BOM_CONVERTER_UNAVAILABLE,
+    BOM_UNEXPECTED_FAILURE,
+)
+
+
 @dataclass(frozen=True)
 class BomConversion:
     """What inventor_to_radan produced, and what it noticed while doing it."""
@@ -2406,6 +2444,13 @@ class BomConversion:
     expected_missing_dxfs: tuple[str, ...] = ()  # in the BOM, no DXF found
     missing_pdfs: tuple[str, ...] = ()
     nonlaser_parts: tuple[str, ...] = ()
+    outcome: str = BOM_NOT_ATTEMPTED
+    # What to tell the user, in their terms, when the outcome blocks.
+    reason: str = ""
+
+    @property
+    def blocked(self) -> bool:
+        return self.outcome in BOM_BLOCKING_OUTCOMES
 
 
 def convert_bom_spreadsheet(
@@ -2425,8 +2470,11 @@ def convert_bom_spreadsheet(
     moved rather than copied so nothing is left behind in the customer's
     folder.
 
-    Never raises for a BOM that simply doesn't convert - intake continues on
-    the scraped sources instead.
+    Never raises. The outcome says which of "it converted", "there was nothing
+    to convert" and "it could not be converted, and here is why" happened -
+    only the first two let intake carry on with the scraped sources. A BOM is
+    the authority for the job, so one that exists but cannot be read has to
+    stop rather than be silently demoted.
     """
     bom_path = Path(bom_path)
     if not bom_path.exists():
@@ -2434,16 +2482,25 @@ def convert_bom_spreadsheet(
 
     try:
         runner = _load_inventor_to_radan()
+    except Exception as exc:
+        return BomConversion(
+            outcome=BOM_CONVERTER_UNAVAILABLE,
+            reason=(
+                f"{bom_path.name} is a BOM, but inventor_to_radan could not be "
+                f"loaded to read it ({exc}). The parts cannot be trusted until "
+                f"it converts."
+            ),
+        )
+
+    try:
         result = runner.run_inline(
             INVENTOR_TO_RADAN_DIR / "inventor_to_radan.py",
             bom_path,
             allow_prompts=False,
             show_summary=False,
         )
-    except Exception:
-        # Includes InventorToRadanNeedsUi / Cancelled / ReportRejected, which
-        # are the documented outcomes when it needs a human and can't have one.
-        return BomConversion()
+    except Exception as exc:
+        return _conversion_failure(bom_path, exc)
 
     findings = {
         "orphan_dxfs": tuple(getattr(result, "orphan_dxfs", ()) or ()),
@@ -2456,7 +2513,14 @@ def convert_bom_spreadsheet(
         f"{bom_path.stem}{RADAN_OUTPUT_SUFFIX}"
     )
     if not output.exists():
-        return BomConversion(**findings)
+        return BomConversion(
+            outcome=BOM_INVALID,
+            reason=(
+                f"{bom_path.name} converted without error but produced no "
+                f"RADAN CSV at {output.name}."
+            ),
+            **findings,
+        )
 
     rows: list[dict[str, Any]] = []
     try:
@@ -2481,15 +2545,81 @@ def convert_bom_spreadsheet(
                         "strategy": str(record[5]).strip(),
                     }
                 )
-    except OSError:
-        return BomConversion(**findings)
+    except OSError as exc:
+        return BomConversion(
+            outcome=BOM_INVALID,
+            reason=f"{bom_path.name} converted, but its RADAN CSV could not be read ({exc}).",
+            **findings,
+        )
 
     if move_output_to is not None:
         rows = _relocate_converter_output(
             output, Path(getattr(result, "report_path", "") or ""), Path(move_output_to), rows
         )
 
-    return BomConversion(rows=tuple(rows), **findings)
+    return BomConversion(rows=tuple(rows), outcome=BOM_CONVERTED, **findings)
+
+
+def _conversion_failure(bom_path: Path, exc: Exception) -> BomConversion:
+    """Name what inventor_to_radan refused to do, in the user's terms.
+
+    The two it raises most are recoverable in a specific, actionable way: a
+    description with no CAM rule yet, and a BOM line whose DXF is missing and
+    needs classifying. Both are answered by running inventor_to_radan
+    interactively, which is the shop's normal way of adding a rule - so the
+    message says that rather than reporting a generic failure.
+
+    Matched on the exception's class *name*, not with isinstance. inline_runner
+    execs inventor_to_radan.py under a private module name and drops it again
+    afterwards, so its exception classes are rebuilt on every call and are
+    never the same objects as any this process could import. isinstance would
+    silently never match, which is exactly the kind of quietly-inert check this
+    work exists to remove.
+    """
+    names = {cls.__name__ for cls in type(exc).__mro__}
+
+    if "InventorToRadanNeedsUi" in names:
+        missing_rules = list(getattr(exc, "missing_rules", ()) or ())
+        missing_dxfs = list(getattr(exc, "missing_dxf_items", ()) or ())
+        if missing_rules:
+            shown = ", ".join(str(rule) for rule in missing_rules[:5])
+            more = f" (and {len(missing_rules) - 5} more)" if len(missing_rules) > 5 else ""
+            return BomConversion(
+                outcome=BOM_NEEDS_RULES,
+                reason=(
+                    f"{bom_path.name} uses {len(missing_rules)} description(s) with no "
+                    f"RADAN rule yet: {shown}{more}. Open {bom_path.name} in "
+                    f"inventor_to_radan to add the rule(s), then re-apply the BOM here."
+                ),
+            )
+        return BomConversion(
+            outcome=BOM_NEEDS_DXF_CLASSIFICATION,
+            reason=(
+                f"{bom_path.name} has {len(missing_dxfs)} line(s) whose DXF is missing "
+                f"and needs classifying. Open it in inventor_to_radan to answer that, "
+                f"then re-apply the BOM here."
+            ),
+        )
+
+    if names & {"InventorToRadanCancelled", "InventorToRadanReportRejected"}:
+        return BomConversion(
+            outcome=BOM_INVALID,
+            reason=(
+                f"{bom_path.name} was not converted: inventor_to_radan stopped "
+                f"before finishing ({exc})."
+            ),
+        )
+
+    if isinstance(exc, ImportError):
+        return BomConversion(
+            outcome=BOM_CONVERTER_UNAVAILABLE,
+            reason=f"inventor_to_radan could not run against {bom_path.name}: {exc}",
+        )
+
+    return BomConversion(
+        outcome=BOM_UNEXPECTED_FAILURE,
+        reason=f"{bom_path.name} could not be converted: {type(exc).__name__}: {exc}",
+    )
 
 
 def _relocate_converter_output(
@@ -2545,8 +2675,12 @@ def apply_cam_bom(entry: dict[str, Any]) -> tuple[int, str]:
 
     rows: dict[str, dict[str, Any]] = {}
     notes: list[str] = []
+    blockers: list[str] = []
     for candidate in candidates:
         conversion = convert_bom_spreadsheet(candidate)
+        if conversion.blocked:
+            blockers.append(conversion.reason)
+            continue
         for row in conversion.rows:
             rows[Path(str(row["filename"])).stem.casefold()] = row
         notes.extend(
@@ -2554,10 +2688,18 @@ def apply_cam_bom(entry: dict[str, Any]) -> tuple[int, str]:
         )
         if rows:
             break
+
+    # Recorded either way: a conversion that now succeeds must clear the block
+    # left by an earlier attempt, which is the whole point of re-applying.
+    entry["bom_blockers"] = blockers
+
     if not rows:
+        if blockers:
+            # Says what it wants, not just that it wanted something.
+            return 0, "\n\n".join(blockers)
         return 0, (
-            "inventor_to_radan couldn't convert the BOM - it may need a rule or a "
-            "missing DXF. Run it directly on the file to see what it wants."
+            "inventor_to_radan converted the BOM but none of its rows matched a "
+            "DXF on this job. Check the BOM is for this job."
         )
 
     updated = 0
@@ -2698,6 +2840,17 @@ def build_import_csv_rows(entry: dict[str, Any]) -> list[list[str]]:
             f"({_description_rules_path()}), so nothing can be validated "
             "against it. Nothing has been imported. Check that the file is "
             "readable, then try again."
+        )
+
+    # A spreadsheet BOM that was recognised but could not be converted. It is
+    # the authority for this job, so the scraped prints do not stand in for it.
+    blockers = [str(reason) for reason in entry.get("bom_blockers", []) if reason]
+    if blockers:
+        raise JobIntakeError(
+            "STOP: this job has a BOM that could not be read, so the parts "
+            "below are not the BOM's answer.\n\n"
+            + "\n".join(f"  - {reason}" for reason in blockers)
+            + "\n\nNothing has been imported. Sort the BOM out and re-apply it."
         )
 
     rows: list[list[str]] = []
