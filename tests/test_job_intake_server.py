@@ -343,6 +343,43 @@ def test_a_failed_intake_also_reaches_a_terminal_state(
     assert status["status"] == job_intake_registry.STATUS_ERROR
 
 
+def test_the_summary_is_served_as_plain_text(client) -> None:
+    """The one multiline value the macro needs.
+
+    Pulling it out of JSON meant the macro had to decode escapes correctly for
+    exactly the string most likely to contain them. Serving it as text removes
+    that whole class of problem.
+    """
+    key = client.post("/api/job-intake", json=_payload(), headers=AUTH).get_json()["key"]
+
+    response = client.get(f"/api/job-intake/summary?key={key}", headers=AUTH)
+    assert response.status_code == 200
+    assert response.mimetype == "text/plain"
+    text = response.get_data(as_text=True)
+    assert "M90001" in text
+    # Multiline, and delivered without any escaping to undo.
+    assert "\n" in text
+    assert "\\n" not in text
+    # Same text the JSON endpoint reports, so the two cannot drift.
+    assert text == client.get(
+        f"/api/job-intake/status?key={key}", headers=AUTH
+    ).get_json()["summary"]
+
+
+def test_the_summary_needs_a_token_and_a_finished_job(client) -> None:
+    assert client.get("/api/job-intake/summary?key=M90001").status_code == 401
+    assert client.get("/api/job-intake/summary?key=nope", headers=AUTH).status_code == 404
+
+
+def test_health_reports_the_api_version_the_macro_checks(client) -> None:
+    body = client.get("/api/health").get_json()
+    assert body["api_version"] == job_intake_server.API_VERSION
+    # Named so an older macro can say what is missing rather than failing at
+    # the point it tries to use it.
+    assert "terminal_state" in body["capabilities"]
+    assert "plain_text_summary" in body["capabilities"]
+
+
 def test_an_intake_interrupted_by_a_restart_is_closed_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

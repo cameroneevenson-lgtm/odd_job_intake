@@ -42,6 +42,11 @@ Private Const MAX_BODY_CHARS As Long = 20000
 Private Const POLL_TIMEOUT_SECONDS As Long = 300
 Private Const POLL_INTERVAL_SECONDS As Long = 2
 
+' The contract this module expects of the listener. It is imported by hand, so
+' it drifts from the server whenever either changes alone. Must match
+' job_intake_server.API_VERSION; bump both together.
+Private Const API_VERSION As Long = 2
+
 
 ' ===== entry point =========================================================
 
@@ -79,6 +84,12 @@ Public Sub SendToJobIntake()
                vbCritical, "Job Intake"
         Exit Sub
     End If
+
+    ' This module is imported by hand, so it drifts from the server the moment
+    ' either is changed alone - and the symptom is a quietly wrong field, not an
+    ' error. Warned about rather than blocked: filing the job still works, and
+    ' refusing outright would strand the user with no way to send anything.
+    If Not CheckApiVersion(response) Then Exit Sub
 
     jobNumber = Trim(UCase(InputBox( _
         "Job number for this email's attachments:" & vbCrLf & vbCrLf & _
@@ -345,15 +356,45 @@ Private Function ReadTextFile(path As String) As String
 End Function
 
 
+' Encode a string for JSON. Line breaks are encoded, not flattened: the server
+' reads the email body line by line to find a W: path and a quantity, and
+' replacing every newline with a space ran those lines together and hid what it
+' was looking for.
 Private Function JsonEscape(text As String) As String
-    Dim result As String
-    result = Replace(text, "\", "\\")
-    result = Replace(result, """", "\""")
-    result = Replace(result, vbCrLf, " ")
-    result = Replace(result, vbCr, " ")
-    result = Replace(result, vbLf, " ")
-    result = Replace(result, vbTab, " ")
-    JsonEscape = result
+    Dim i As Long, code As Long, ch As String
+    Dim out As String
+
+    For i = 1 To Len(text)
+        ch = Mid(text, i, 1)
+        code = AscW(ch)
+        ' AscW returns a signed 16-bit value, so anything above &H7FFF comes
+        ' back negative. Those are ordinary characters and pass through.
+        If code < 0 Then
+            out = out & ch
+        ElseIf code = 34 Then
+            out = out & "\"""
+        ElseIf code = 92 Then
+            out = out & "\\"
+        ElseIf code = 8 Then
+            out = out & "\b"
+        ElseIf code = 9 Then
+            out = out & "\t"
+        ElseIf code = 10 Then
+            out = out & "\n"
+        ElseIf code = 12 Then
+            out = out & "\f"
+        ElseIf code = 13 Then
+            out = out & "\r"
+        ElseIf code < 32 Then
+            ' Any other control character. Invalid raw in JSON, and Outlook
+            ' bodies do carry the odd stray one.
+            out = out & "\u" & Right$("000" & Hex$(code), 4)
+        Else
+            out = out & ch
+        End If
+    Next
+
+    JsonEscape = out
 End Function
 
 
@@ -374,35 +415,67 @@ End Function
 ' Deliberately minimal: pulls one scalar out of the listener's flat JSON
 ' responses. Not a general parser - if a response ever nests, parse it
 ' properly rather than extending this.
+'
+' It does have to honour escapes, though. It used to stop the value at the
+' first quote it saw, so any error message containing one was truncated - and
+' it "unescaped" by replacing \\" and \\\\, which are not sequences JSON ever
+' produces, so a real \" or \\ came through untouched. VBA has no backslash
+' escaping in string literals, which is how those got written.
 Private Function JsonValue(json As String, key As String) As String
-    Dim marker As String, start As Long, finish As Long
-    Dim value As String
+    Dim marker As String, start As Long, i As Long, code As Long
+    Dim ch As String, out As String
 
     marker = """" & key & """:"
     start = InStr(json, marker)
     If start = 0 Then Exit Function
-    start = start + Len(marker)
+    i = start + Len(marker)
 
-    Do While start <= Len(json) And Mid(json, start, 1) = " "
-        start = start + 1
+    Do While i <= Len(json) And Mid(json, i, 1) = " "
+        i = i + 1
     Loop
 
-    If Mid(json, start, 1) = """" Then
-        start = start + 1
-        finish = InStr(start, json, """")
-        If finish = 0 Then Exit Function
-        value = Mid(json, start, finish - start)
-        value = Replace(value, "\\""", """")
-        value = Replace(value, "\\\\", "\")
-    Else
-        finish = start
-        Do While finish <= Len(json) And InStr(",}]", Mid(json, finish, 1)) = 0
-            finish = finish + 1
+    If Mid(json, i, 1) <> """" Then
+        ' A bare literal: number, true, false, null.
+        start = i
+        Do While i <= Len(json) And InStr(",}]", Mid(json, i, 1)) = 0
+            i = i + 1
         Loop
-        value = Trim(Mid(json, start, finish - start))
+        JsonValue = Trim(Mid(json, start, i - start))
+        Exit Function
     End If
 
-    JsonValue = value
+    i = i + 1
+    Do While i <= Len(json)
+        ch = Mid(json, i, 1)
+        If ch = """" Then
+            Exit Do
+        ElseIf ch = "\" Then
+            i = i + 1
+            ch = Mid(json, i, 1)
+            Select Case ch
+                Case "n": out = out & vbLf
+                Case "r": out = out & vbCr
+                Case "t": out = out & vbTab
+                Case "b": out = out & Chr$(8)
+                Case "f": out = out & Chr$(12)
+                Case "u"
+                    ' \uXXXX. ChrW takes a signed Integer, so anything above
+                    ' &H7FFF has to be brought into range or it overflows.
+                    code = CLng("&H" & Mid(json, i + 1, 4))
+                    If code > 32767 Then code = code - 65536
+                    out = out & ChrW$(code)
+                    i = i + 4
+                Case Else
+                    ' Covers \" \\ \/ - the character stands for itself.
+                    out = out & ch
+            End Select
+        Else
+            out = out & ch
+        End If
+        i = i + 1
+    Loop
+
+    JsonValue = out
 End Function
 
 
@@ -411,6 +484,7 @@ Private Sub WaitForIntakeAndReply(mail As Outlook.MailItem, baseUrl As String, _
     Dim deadline As Date
     Dim response As String, status As Long
     Dim summary As String, intakeError As String
+    Dim finished As Boolean
 
     If Len(key) = 0 Then Exit Sub
 
@@ -423,7 +497,7 @@ Private Sub WaitForIntakeAndReply(mail As Outlook.MailItem, baseUrl As String, _
             ' "complete" alone meant a job that had already failed still cost
             ' the full timeout before saying anything.
             If LCase(JsonValue(response, "done")) = "true" Then
-                summary = JsonValue(response, "summary")
+                finished = (LCase(JsonValue(response, "complete")) = "true")
                 intakeError = JsonValue(response, "error")
                 Exit Do
             End If
@@ -435,6 +509,16 @@ Private Sub WaitForIntakeAndReply(mail As Outlook.MailItem, baseUrl As String, _
 
         WaitWithEvents POLL_INTERVAL_SECONDS
     Loop While Now < deadline
+
+    If finished Then
+        ' Fetched as text/plain rather than dug out of the JSON above. It is
+        ' the one multiline value here, so it is the one most likely to be
+        ' mangled by a hand-rolled JSON reader - and there is no reason to
+        ' encode it only to decode it again.
+        summary = HttpCall("GET", baseUrl & "/api/job-intake/summary?key=" & _
+                           EncodeUrl(key), token, "", status)
+        If status <> 200 Then summary = ""
+    End If
 
     If Len(summary) = 0 Then
         If Len(intakeError) > 0 And LCase(intakeError) <> "null" Then
@@ -454,6 +538,29 @@ Private Sub WaitForIntakeAndReply(mail As Outlook.MailItem, baseUrl As String, _
 
     DraftReply mail, summary
 End Sub
+
+
+' True to carry on. Only False if the user chooses to stop.
+Private Function CheckApiVersion(healthResponse As String) As Boolean
+    Dim serverVersion As String, answer As VbMsgBoxResult
+
+    CheckApiVersion = True
+    serverVersion = JsonValue(healthResponse, "api_version")
+    ' A server too old to report one predates this check; nothing to compare.
+    If Len(serverVersion) = 0 Then Exit Function
+    If Val(serverVersion) = API_VERSION Then Exit Function
+
+    answer = MsgBox( _
+        "This Outlook macro and the shop app are different versions." & vbCrLf & vbCrLf & _
+        "  Macro:      " & API_VERSION & vbCrLf & _
+        "  Shop app:   " & serverVersion & vbCrLf & vbCrLf & _
+        "Re-import JobIntake.bas from C:\Tools\odd_job_intake\outlook_vba to " & _
+        "match. Filing a job will probably still work, but some details may " & _
+        "come back wrong." & vbCrLf & vbCrLf & _
+        "Carry on anyway?", vbExclamation Or vbYesNo Or vbDefaultButton2, "Job Intake")
+
+    CheckApiVersion = (answer = vbYes)
+End Function
 
 
 ' Sleep without freezing Outlook: DoEvents lets it keep painting and

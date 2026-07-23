@@ -44,6 +44,21 @@ HOST = "127.0.0.1"
 DEFAULT_PORT = 8790
 TOKEN_PATH = APP_DIR / "_runtime" / "job_intake_api_token.key"
 
+# The contract between this listener and the Outlook macro. The macro is a file
+# the user imports by hand, so the two versions drift the moment either is
+# changed without the other - and the symptom is a silently wrong field rather
+# than an error. Bump on any change to a request or response shape the macro
+# depends on, and bump JobIntake.bas's API_VERSION with it.
+API_VERSION = 2
+API_CAPABILITIES = frozenset(
+    {
+        "async_intake",       # begin/complete split, status polled by key
+        "terminal_state",     # status returns state + done, failures included
+        "plain_text_summary", # summary readable without parsing JSON
+        "json_escapes",       # bodies encode newlines rather than flattening
+    }
+)
+
 # Outlook attachments arrive base64-encoded in JSON, so the decoded payload is
 # ~1.33x smaller than the request. A DXF set for one job is far under this;
 # the cap just stops a malformed request from exhausting memory.
@@ -261,7 +276,16 @@ def create_app(
         # Unauthenticated on purpose: the task pane uses this to tell "the
         # desktop app isn't running" apart from "the token is wrong", and it
         # reveals nothing beyond the fact that the listener is up.
-        return jsonify({"status": "ok", "service": "odd_job_intake"})
+        return jsonify(
+            {
+                "status": "ok",
+                "service": "odd_job_intake",
+                "api_version": API_VERSION,
+                # What this listener can do, so an older macro can say what is
+                # missing instead of failing at the point it tries to use it.
+                "capabilities": sorted(API_CAPABILITIES),
+            }
+        )
 
     @app.get("/job-intake-root-ca.crt")
     def root_ca() -> Response:
@@ -383,6 +407,28 @@ def create_app(
                 # touching the macro.
                 "summary": job_intake_service.intake_summary_text(entry) if complete else "",
             }
+        )
+
+    @app.get("/api/job-intake/summary")
+    def intake_summary() -> tuple[Response, int] | Response:
+        """The reply text, as text.
+
+        The summary is the one multiline value the macro needs, and pulling it
+        out of JSON means the macro has to decode escapes correctly for the
+        thing most likely to contain them. Serving it as text/plain removes
+        that whole class of problem: the macro reads the body and uses it.
+        """
+        if not _authorized():
+            return jsonify({"error": "Unauthorized."}), 401
+        key = str(request.args.get("key", "")).strip()
+        entry = job_intake_registry.get_entry(key)
+        if entry is None:
+            return jsonify({"error": f"No intake found for {key}."}), 404
+        if not entry.get("complete"):
+            return jsonify({"error": f"{key} has not finished."}), 409
+        return Response(
+            job_intake_service.intake_summary_text(entry),
+            mimetype="text/plain; charset=utf-8",
         )
 
     @app.post("/api/job-intake")

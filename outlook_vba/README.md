@@ -27,6 +27,17 @@ This creates `%APPDATA%\Microsoft\Outlook\VbaProject.OTM` (there is no macro
 project on this machine yet). Note that file is **not** version controlled —
 re-import from here after an Outlook profile rebuild.
 
+**Re-import whenever this file changes.** The copy inside Outlook is a snapshot;
+editing it here does nothing until it is imported again. The macro and the
+listener each declare an `API_VERSION` (`Private Const API_VERSION` here,
+`job_intake_server.API_VERSION` there) and the macro warns at startup when they
+disagree, so a missed re-import shows up as a prompt rather than as a quietly
+wrong field. A test asserts the two match in the repo.
+
+To re-import: Alt+F11 → right-click the `JobIntake` module → **Remove
+JobIntake** → *No* when asked to export → File → **Import File…** → this file →
+Ctrl+S. Then re-sign if you signed it (below).
+
 ### 2. Deal with macro security — do this, or the button silently won't run
 
 Outlook's default is *"Notifications for digitally signed macros, all other
