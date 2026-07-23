@@ -18,7 +18,7 @@ C:\Tools\.venv\Scripts\python.exe app.py
 | File | Role |
 | --- | --- |
 | `paths.py` | Shop paths, `JOB_PREFIX_TO_ROOT`, registry location. Change shop locations only here. |
-| `job_intake_registry.py` | Atomic JSON registry of intakes (`_runtime/job_intake_registry.json`). No Qt. |
+| `job_intake_registry.py` | Transactional SQLite registry of intakes (`_runtime/job_intake_registry.db`). Entries are JSON blobs in a `data` column, keyed by `job_number`+`label`. No Qt. |
 | `job_intake_service.py` | All orchestration: `create_intake` (the whole intake sequence), path resolution, folder creation, RPD clone, PO scraping, import-CSV build, RADAN/block wrappers. **No Qt** — that's what lets the listener reuse it. |
 | `job_intake_page.py` | `JobIntakePage` Qt widget: queue table, parts grid, action buttons, background polling. |
 | `job_intake_server.py` | Loopback HTTPS listener for the Outlook add-in. Owns no intake logic. |

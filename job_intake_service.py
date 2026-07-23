@@ -887,9 +887,10 @@ def complete_intake(
         # this is retryable from the desktop page.
         entry["error"] = entry_rpd_error
 
-    # Set last: the caller polls for this to know the slow half has finished,
-    # so it must not appear until everything else has been written.
+    # Set last: the caller polls for these to know the slow half has finished,
+    # so they must not appear until everything else has been written.
     entry["complete"] = True
+    entry["state"] = job_intake_registry.STATE_SUCCEEDED
 
     # Updated, not appended: begin_intake already claimed the key. Written in
     # one call so the queue never shows a half-filled job.
@@ -901,7 +902,7 @@ def complete_intake(
                 "provisional", "ingested_from", "source_paths", "job_folder",
                 "po_number", "due_date", "due_note", "attachments",
                 "material_qty", "po_unmatched", "email_body", "status",
-                "rpd_path", "error", "complete",
+                "rpd_path", "error", "complete", "state",
             )
             if field in entry
         },

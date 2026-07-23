@@ -410,7 +410,7 @@ Private Sub WaitForIntakeAndReply(mail As Outlook.MailItem, baseUrl As String, _
                                   token As String, key As String, jobFolder As String)
     Dim deadline As Date
     Dim response As String, status As Long
-    Dim summary As String
+    Dim summary As String, intakeError As String
 
     If Len(key) = 0 Then Exit Sub
 
@@ -419,8 +419,12 @@ Private Sub WaitForIntakeAndReply(mail As Outlook.MailItem, baseUrl As String, _
         response = HttpCall("GET", baseUrl & "/api/job-intake/status?key=" & _
                             EncodeUrl(key), token, "", status)
         If status = 200 Then
-            If LCase(JsonValue(response, "complete")) = "true" Then
+            ' "done" covers a failure as well as a success. Waiting on
+            ' "complete" alone meant a job that had already failed still cost
+            ' the full timeout before saying anything.
+            If LCase(JsonValue(response, "done")) = "true" Then
                 summary = JsonValue(response, "summary")
+                intakeError = JsonValue(response, "error")
                 Exit Do
             End If
         ElseIf status <> 404 Then
@@ -433,10 +437,18 @@ Private Sub WaitForIntakeAndReply(mail As Outlook.MailItem, baseUrl As String, _
     Loop While Now < deadline
 
     If Len(summary) = 0 Then
-        MsgBox "Filed, and the shop app is still working on it." & vbCrLf & vbCrLf & _
-               "Folder: " & jobFolder & vbCrLf & vbCrLf & _
-               "Open the Job Intake tab to see the parts when they appear.", _
-               vbInformation, "Job Intake"
+        If Len(intakeError) > 0 And LCase(intakeError) <> "null" Then
+            MsgBox "Filed, but the shop app could not finish reading it." & vbCrLf & vbCrLf & _
+                   intakeError & vbCrLf & vbCrLf & _
+                   "Folder: " & jobFolder & vbCrLf & vbCrLf & _
+                   "Open the Job Intake tab to sort it out.", _
+                   vbExclamation, "Job Intake"
+        Else
+            MsgBox "Filed, and the shop app is still working on it." & vbCrLf & vbCrLf & _
+                   "Folder: " & jobFolder & vbCrLf & vbCrLf & _
+                   "Open the Job Intake tab to see the parts when they appear.", _
+                   vbInformation, "Job Intake"
+        End If
         Exit Sub
     End If
 

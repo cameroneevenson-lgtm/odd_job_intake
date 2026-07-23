@@ -24,9 +24,11 @@ the app:
 5. Runs the headless RADAN import to convert the DXFs and register the parts.
 6. After you nest in RADAN, sends the block files to the machine (verified copy).
 
-Every intake is tracked in a small JSON registry (`_runtime/`), so the queue
-survives restarts and can later be fed by an Outlook add-in as well as the
-manual button.
+Every intake is tracked in a small SQLite registry (`_runtime/`), so the queue
+survives restarts and can be fed by the Outlook button as well as the manual
+one. SQLite rather than a file because three things write to it at once - the
+listener, its background extraction worker, and this UI - and the job number is
+claimed atomically so the same job cannot be filed twice.
 
 ## Running
 
@@ -50,7 +52,7 @@ constructor argument and touches it only inside button handlers.
 | `app.py` | Standalone window launcher |
 | `job_intake_page.py` | `JobIntakePage` Qt widget (queue + parts grid + actions) |
 | `job_intake_service.py` | Non-Qt orchestration: paths, RPD clone, PO extraction, CSV build, RADAN/block wrappers |
-| `job_intake_registry.py` | Atomic JSON registry of intakes |
+| `job_intake_registry.py` | Transactional SQLite registry of intakes |
 | `explorer_bridge.py` | Loads truck_nest_explorer's RADAN import + block transfer |
 | `paths.py` | Shop paths and prefix→root mapping |
 | `docs/PLAN.md` | Full design record, including the planned Outlook add-in phases |

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 from datetime import date
+import json
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -77,6 +79,124 @@ def test_registry_load_entries_newest_first(tmp_path: Path) -> None:
     append_entry(first, registry_path)
     append_entry(second, registry_path)
     assert [entry["job_number"] for entry in load_entries(registry_path)] == ["M50002", "M50001"]
+
+
+def test_concurrent_updates_to_different_fields_do_not_lose_each_other(
+    tmp_path: Path,
+) -> None:
+    """The race the JSON store lost.
+
+    Three writers touch this registry: the Flask request thread, its background
+    extraction worker, and the Qt UI. Read-modify-write over a whole JSON file
+    meant two of them saving at once ended with the second overwriting the
+    first's field. Each update now runs inside its own transaction, so every
+    write survives regardless of interleaving.
+    """
+    registry_path = tmp_path / "registry.json"
+    append_entry(new_entry(job_number="M51000"), registry_path)
+
+    errors: list[BaseException] = []
+    start = threading.Barrier(8)
+
+    def write(index: int) -> None:
+        try:
+            start.wait(timeout=10)
+            update_entry("M51000", registry_path, **{f"field_{index}": index})
+        except BaseException as exc:  # surfaced on the main thread below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(index,)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not errors, errors
+    entry = get_entry("M51000", registry_path)
+    assert entry is not None
+    for index in range(8):
+        assert entry[f"field_{index}"] == index, f"update {index} was lost"
+
+
+def test_two_intakes_racing_for_one_job_number_leave_exactly_one_winner(
+    tmp_path: Path,
+) -> None:
+    """Claiming a job is what stops the same one being filed twice.
+
+    The old check was "load, look for the key, append", which two callers could
+    both pass before either wrote. The primary key decides it instead: one
+    INSERT wins and the rest get the same ValueError the check used to raise.
+    """
+    registry_path = tmp_path / "registry.json"
+    claimed: list[str] = []
+    refused: list[str] = []
+    start = threading.Barrier(6)
+
+    def claim() -> None:
+        start.wait(timeout=10)
+        try:
+            append_entry(new_entry(job_number="M51001"), registry_path)
+            claimed.append("won")
+        except ValueError:
+            refused.append("lost")
+
+    threads = [threading.Thread(target=claim) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert len(claimed) == 1, "a job number was claimed more than once"
+    assert len(refused) == 5
+    assert len(load_entries(registry_path)) == 1
+
+
+def test_the_old_json_registry_is_carried_across_on_first_use(tmp_path: Path) -> None:
+    """Upgrading must not lose jobs already in the queue."""
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "entries": [
+                    {
+                        "key": "F59487",
+                        "job_number": "F59487",
+                        "received_at": "2026-07-01T08:00:00",
+                        "status": STATUS_RPD_CREATED,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entry = get_entry("F59487", registry_path)
+    assert entry is not None
+    assert entry["status"] == STATUS_RPD_CREATED
+
+    # Renamed rather than deleted: an upgrade should not destroy the old file,
+    # and leaving it in place would re-import entries that have since changed.
+    assert not registry_path.exists()
+    assert registry_path.with_suffix(".json.migrated").exists()
+
+    update_entry("F59487", registry_path, status=job_intake_registry.STATUS_BLOCKS_SENT)
+    assert get_entry("F59487", registry_path)["status"] == job_intake_registry.STATUS_BLOCKS_SENT
+
+
+def test_an_entry_written_before_states_existed_reads_as_finished(tmp_path: Path) -> None:
+    """Those entries were saved synchronously, so they really are done - and
+    reporting them as still running would hang a poller on them forever."""
+    assert job_intake_registry.entry_state({"key": "M51002"}) == (
+        job_intake_registry.STATE_SUCCEEDED
+    )
+    # A manual intake is likewise complete the moment it is written.
+    assert job_intake_registry.entry_state(new_entry(job_number="M51003")) == (
+        job_intake_registry.STATE_SUCCEEDED
+    )
+    assert job_intake_registry.entry_state(
+        new_entry(job_number="M51004", source="outlook")
+    ) == job_intake_registry.STATE_QUEUED
 
 
 # --- path resolution ---------------------------------------------------------

@@ -253,6 +253,70 @@ def test_a_path_that_does_not_exist_is_not_recorded_as_a_source(client) -> None:
     assert job_intake_registry.load_entries()[0]["source_paths"] == []
 
 
+# --- async terminal state ----------------------------------------------------
+
+
+def test_a_finished_intake_reports_a_terminal_state(client) -> None:
+    response = client.post("/api/job-intake", json=_payload(), headers=AUTH)
+    key = response.get_json()["key"]
+
+    status = client.get(f"/api/job-intake/status?key={key}", headers=AUTH).get_json()
+    assert status["state"] == job_intake_registry.STATE_SUCCEEDED
+    assert status["done"] is True
+    assert status["complete"] is True
+    assert status["summary"]
+
+
+def test_a_failed_intake_also_reaches_a_terminal_state(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The half of the state machine that used to be missing.
+
+    A failure recorded only as an `error` left `state` at running forever, so
+    the macro polled until its five-minute timeout and then told the user the
+    job was "still working" - about a job that had already died. Both endings
+    have to be reachable or the poller can never stop early.
+    """
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("the scrape blew up")
+
+    monkeypatch.setattr(job_intake_service, "complete_intake", explode)
+
+    response = client.post("/api/job-intake", json=_payload(), headers=AUTH)
+    # The claim itself still succeeds - begin_intake made the folder before the
+    # slow half ran - so the failure surfaces through the status endpoint.
+    assert response.status_code == 201
+    key = response.get_json()["key"]
+
+    status = client.get(f"/api/job-intake/status?key={key}", headers=AUTH).get_json()
+    assert status["state"] == job_intake_registry.STATE_FAILED
+    assert status["done"] is True, "a failed intake must stop the caller polling"
+    assert status["complete"] is False
+    assert "the scrape blew up" in status["error"]
+    assert status["status"] == job_intake_registry.STATUS_ERROR
+
+
+def test_an_intake_interrupted_by_a_restart_is_closed_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing will ever finish a job whose worker thread died with the process,
+    so a restart must not leave it looking like it is still going."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    monkeypatch.setattr(
+        job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
+    )
+    entry = job_intake_registry.new_entry(job_number="M90777", source="outlook")
+    job_intake_registry.append_entry(entry)
+    job_intake_registry.set_state(entry["key"], job_intake_registry.STATE_RUNNING)
+
+    job_intake_server.create_app(token=TOKEN, run_in_background=False)
+
+    reloaded = job_intake_registry.get_entry(entry["key"])
+    assert reloaded["state"] == job_intake_registry.STATE_FAILED
+    assert "interrupted" in reloaded["error"]
+
+
 def test_a_request_with_no_dxf_is_refused(client) -> None:
     response = client.post(
         "/api/job-intake",

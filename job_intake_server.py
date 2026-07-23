@@ -145,9 +145,19 @@ def _finish_intake(
     Failures are recorded on the entry rather than raised: nobody is waiting
     on this call, and a job whose folder exists but whose parts didn't resolve
     is still better surfaced in the queue than lost.
+
+    Both endings must reach a terminal state. The macro polls until it sees
+    one, so a failure left as `running` costs the user the whole five-minute
+    timeout and then reports "still working" about a job that is already dead.
     """
     key = str(entry.get("key", ""))
     try:
+        job_intake_registry.set_state(key, job_intake_registry.STATE_RUNNING)
+    except ValueError:
+        _logger.error("Could not mark %s as running.", key)
+    try:
+        # complete_intake writes STATE_SUCCEEDED itself, last, once everything
+        # else about the entry has been saved.
         job_intake_service.complete_intake(entry, files, email_body=email_body)
         _logger.info("Completed intake %s (%d parts).", key, len(entry.get("material_qty", [])))
     except Exception as exc:
@@ -155,8 +165,11 @@ def _finish_intake(
         # The entry already exists - begin_intake claimed it - so the failure
         # is recorded on it and shows up in the desktop queue.
         try:
-            job_intake_registry.update_entry(
-                key, error=f"Intake failed after queuing: {exc}"
+            job_intake_registry.set_state(
+                key,
+                job_intake_registry.STATE_FAILED,
+                status=job_intake_registry.STATUS_ERROR,
+                error=f"Intake failed after queuing: {exc}",
             )
         except ValueError:
             _logger.error("Could not record the failure for %s.", key)
@@ -189,6 +202,22 @@ def create_app(
         static_folder=str(APP_DIR / "static"),
     )
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
+
+    # Any intake still marked queued/running belongs to a worker thread that
+    # died with the previous process - nothing will ever finish it. Closing
+    # them out here is what keeps a poller from waiting on a job that stopped
+    # when the app was last closed.
+    try:
+        stranded = job_intake_registry.fail_interrupted_entries()
+        if stranded:
+            _logger.warning(
+                "Closed out %d intake(s) interrupted by a restart: %s",
+                len(stranded),
+                ", ".join(stranded),
+            )
+    except Exception:
+        _logger.exception("Could not check for interrupted intakes.")
+
     expected_token = token if token is not None else ensure_api_token()
     # Baked into the add-in manifest's URLs, so it must be the port actually
     # served rather than whatever the default happens to be.
@@ -307,11 +336,18 @@ def create_app(
         if entry is None:
             return jsonify({"error": f"No intake found for {key}."}), 404
 
+        state = job_intake_registry.entry_state(entry)
+        # `done` is what a poller waits on, and it is true for a failure too -
+        # otherwise a job that has already failed keeps the caller waiting out
+        # its full timeout. `complete` stays as-is for older callers, meaning
+        # specifically "finished successfully".
         complete = bool(entry.get("complete"))
         return jsonify(
             {
                 "key": key,
                 "complete": complete,
+                "state": state,
+                "done": state in job_intake_registry.TERMINAL_STATES,
                 "status": entry.get("status"),
                 "error": entry.get("error"),
                 "parts": len(entry.get("material_qty", [])),
@@ -420,6 +456,15 @@ def create_app(
                     # Derived from the job number alone, so it is real already.
                     "job_folder": entry.get("job_folder"),
                     "status": entry.get("status") if not run_in_background else "queued",
+                    # Where to look for the rest: anything non-terminal means
+                    # the caller should poll /api/job-intake/status.
+                    "state": (
+                        job_intake_registry.entry_state(
+                            job_intake_registry.get_entry(str(entry.get("key", "")))
+                        )
+                        if not run_in_background
+                        else job_intake_registry.STATE_QUEUED
+                    ),
                     "attachments": (
                         [str(item.get("filename")) for item in entry.get("attachments", [])]
                         if not run_in_background
