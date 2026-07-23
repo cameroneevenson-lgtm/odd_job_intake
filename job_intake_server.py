@@ -292,6 +292,38 @@ def create_app(
             }
         )
 
+    @app.get("/api/job-intake/status")
+    def intake_status() -> tuple[Response, int] | Response:
+        """Whether a queued intake has finished, and its summary once it has.
+
+        Polled by the caller after a submit: the slow half runs on a background
+        thread and there is no way to push the result back, so this is how a
+        summary reaches anything outside this process.
+        """
+        if not _authorized():
+            return jsonify({"error": "Unauthorized."}), 401
+        key = str(request.args.get("key", "")).strip()
+        entry = job_intake_registry.get_entry(key)
+        if entry is None:
+            return jsonify({"error": f"No intake found for {key}."}), 404
+
+        complete = bool(entry.get("complete"))
+        return jsonify(
+            {
+                "key": key,
+                "complete": complete,
+                "status": entry.get("status"),
+                "error": entry.get("error"),
+                "parts": len(entry.get("material_qty", [])),
+                "po_number": entry.get("po_number"),
+                "due_date": entry.get("due_date"),
+                "job_folder": entry.get("job_folder"),
+                # Composed server-side so the wording can change without
+                # touching the macro.
+                "summary": job_intake_service.intake_summary_text(entry) if complete else "",
+            }
+        )
+
     @app.post("/api/job-intake")
     def submit_job_intake() -> tuple[Response, int] | Response:
         if not _authorized():

@@ -36,6 +36,12 @@ Private Const ALLOWED_EXTENSIONS As String = ".dxf|.pdf|.csv|.xlsx"
 ' "Only comments may appear after End Sub/End Function" compile error.
 Private Const MAX_BODY_CHARS As Long = 20000
 
+' How long to wait for the server's background half, and how often to ask. A
+' 28-file job across two network shares took about a minute; five is generous
+' without hanging forever on something that has genuinely stalled.
+Private Const POLL_TIMEOUT_SECONDS As Long = 300
+Private Const POLL_INTERVAL_SECONDS As Long = 2
+
 
 ' ===== entry point =========================================================
 
@@ -103,7 +109,11 @@ Public Sub SendToJobIntake()
     response = HttpCall("POST", baseUrl & "/api/job-intake", token, payload, status)
 
     If status = 201 Then
-        ShowSuccess response
+        ' The server answers as soon as the job is claimed and does the slow
+        ' work - copying off W:, reading the drawings - on its own thread. Wait
+        ' for that here rather than in the request, so Outlook stays usable.
+        WaitForIntakeAndReply mail, baseUrl, token, JsonValue(response, "key"), _
+                              JsonValue(response, "job_folder")
     Else
         MsgBox "The intake was not filed (HTTP " & status & ")." & vbCrLf & vbCrLf & _
                JsonValue(response, "error"), vbExclamation, "Job Intake"
@@ -394,6 +404,71 @@ Private Function JsonValue(json As String, key As String) As String
 
     JsonValue = value
 End Function
+
+
+Private Sub WaitForIntakeAndReply(mail As Outlook.MailItem, baseUrl As String, _
+                                  token As String, key As String, jobFolder As String)
+    Dim deadline As Date
+    Dim response As String, status As Long
+    Dim summary As String
+
+    If Len(key) = 0 Then Exit Sub
+
+    deadline = DateAdd("s", POLL_TIMEOUT_SECONDS, Now)
+    Do
+        response = HttpCall("GET", baseUrl & "/api/job-intake/status?key=" & _
+                            EncodeUrl(key), token, "", status)
+        If status = 200 Then
+            If LCase(JsonValue(response, "complete")) = "true" Then
+                summary = JsonValue(response, "summary")
+                Exit Do
+            End If
+        ElseIf status <> 404 Then
+            ' 404 can happen for a moment before the entry is readable; any
+            ' other failure means waiting longer will not help.
+            Exit Do
+        End If
+
+        WaitWithEvents POLL_INTERVAL_SECONDS
+    Loop While Now < deadline
+
+    If Len(summary) = 0 Then
+        MsgBox "Filed, and the shop app is still working on it." & vbCrLf & vbCrLf & _
+               "Folder: " & jobFolder & vbCrLf & vbCrLf & _
+               "Open the Job Intake tab to see the parts when they appear.", _
+               vbInformation, "Job Intake"
+        Exit Sub
+    End If
+
+    DraftReply mail, summary
+End Sub
+
+
+' Sleep without freezing Outlook: DoEvents lets it keep painting and
+' responding while the shop app works, which a blocking call would not.
+Private Sub WaitWithEvents(seconds As Long)
+    Dim until As Date
+    until = DateAdd("s", seconds, Now)
+    Do While Now < until
+        DoEvents
+    Loop
+End Sub
+
+
+' Opens the reply as a draft rather than sending it. What goes back to whoever
+' asked for the job is their call to make and their words to approve - this
+' only saves the typing.
+Private Sub DraftReply(mail As Outlook.MailItem, summary As String)
+    Dim reply As Outlook.MailItem
+    On Error GoTo Fail
+    Set reply = mail.reply
+    reply.Body = summary & vbCrLf & vbCrLf & String(50, "-") & vbCrLf & reply.Body
+    reply.Display
+    Exit Sub
+Fail:
+    ' A draft that cannot be opened is not worth losing the summary over.
+    MsgBox summary, vbInformation, "Job Intake"
+End Sub
 
 
 Private Sub ShowSuccess(response As String)

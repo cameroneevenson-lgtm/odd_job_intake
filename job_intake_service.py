@@ -276,6 +276,64 @@ def extract_email_hints(text: str) -> EmailHints:
     return EmailHints(material=material, qty=qty, material_source_text=source)
 
 
+def intake_summary_text(entry: dict[str, Any]) -> str:
+    """A plain-text summary of a finished intake, for a reply email.
+
+    Composed here rather than in the macro: the wording will keep changing as
+    the extraction does, and changing it in Python costs nothing while changing
+    it in VBA means re-importing and re-signing on every machine.
+
+    Deliberately states what is *not* known as loudly as what is - an
+    unanswered quantity or a material nobody has checked is the useful part of
+    this message, not the row count.
+    """
+    parts = list(entry.get("material_qty", []))
+    lines = [
+        f"Job {entry.get('job_number')}"
+        + (f" / {entry['label']}" if entry.get("label") else "")
+        + " has been set up for laser.",
+        "",
+        f"Folder: {entry.get('job_folder')}",
+    ]
+    if entry.get("po_number"):
+        lines.append(f"PO: {entry['po_number']}")
+    if entry.get("due_date"):
+        lines.append(f"Due: {entry['due_date']}")
+
+    lines += ["", f"Parts ({len(parts)}):"]
+    for part in parts:
+        material = str(part.get("material") or "not determined")
+        thickness = part.get("thickness") or 0
+        qty = part.get("qty")
+        flag = ""
+        if part.get("qty_unknown"):
+            flag = "  <- quantity not stated"
+        elif part.get("source_conflict"):
+            flag = "  <- sources disagree"
+        lines.append(
+            f"  {part.get('filename'):<22} {material:<20} "
+            f"{thickness if thickness else '?':>6}  qty {qty}{flag}"
+        )
+
+    notes = [str(note) for note in entry.get("po_unmatched", []) if str(note).strip()]
+    unanswered = [p.get("filename") for p in parts if p.get("qty_unknown")]
+    conflicts = [p.get("filename") for p in parts if p.get("source_conflict")]
+    if notes or unanswered or conflicts:
+        lines += ["", "Needs checking:"]
+        lines += [f"  - {note}" for note in notes]
+        if unanswered:
+            lines.append(f"  - No quantity stated for: {', '.join(map(str, unanswered))}")
+        if conflicts:
+            lines.append(f"  - Sources disagree for: {', '.join(map(str, conflicts))}")
+
+    lines += [
+        "",
+        "Nothing has been cut. Materials still need checking in the shop app "
+        "before the parts are imported to RADAN.",
+    ]
+    return "\n".join(lines)
+
+
 def begin_intake(
     job_number: str,
     label: str | None,
@@ -720,6 +778,10 @@ def complete_intake(
         # this is retryable from the desktop page.
         entry["error"] = entry_rpd_error
 
+    # Set last: the caller polls for this to know the slow half has finished,
+    # so it must not appear until everything else has been written.
+    entry["complete"] = True
+
     # Updated, not appended: begin_intake already claimed the key. Written in
     # one call so the queue never shows a half-filled job.
     job_intake_registry.update_entry(
@@ -730,7 +792,7 @@ def complete_intake(
                 "provisional", "ingested_from", "source_paths", "job_folder",
                 "po_number", "due_date", "due_note", "attachments",
                 "material_qty", "po_unmatched", "email_body", "status",
-                "rpd_path", "error",
+                "rpd_path", "error", "complete",
             )
             if field in entry
         },
@@ -1169,6 +1231,25 @@ _PO_NON_ITEM_PREFIXES = (
     "drawing number",
     "description",
     "pricing",
+    # Title-block labels. The PO scrape also runs over drawing prints, and
+    # these read like table rows to it. Harmless noise in a log; not harmless
+    # in the summary that goes into a reply to whoever sent the job.
+    "last update",
+    "tolerances",
+    "unless otherwise",
+    "angles",
+    "inches",
+    "drawn",
+    "checked",
+    "material",
+    "gauge",
+    "sheet",
+    "scale",
+    "title",
+    "rev",
+    "size",
+    "dwg",
+    "qty",
 )
 
 
