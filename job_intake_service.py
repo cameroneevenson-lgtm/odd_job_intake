@@ -2669,12 +2669,19 @@ def launch_radan_import(
 ) -> Any:
     """Real RADAN COM conversion via the proven headless import pipeline;
     symbols land flat in the intake dir next to their DXFs (M59919 shape).
-    Never uses the experimental lab symbol writer."""
+    Never uses the experimental lab symbol writer.
+
+    refresh_project_sheets adds the stock sheets to the project, which
+    truck_nest_explorer's own full flow also does (full_flow_service.py:326).
+    Without it the parts import but the project has nothing to nest them on,
+    so nesting cannot follow.
+    """
     return explorer_services.launch_radan_csv_import(
         csv_path,
         paths.intake_dir,
         project_path=paths.rpd_path,
         log_path=log_path,
+        refresh_project_sheets=True,
     )
 
 
