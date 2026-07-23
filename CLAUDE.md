@@ -21,7 +21,7 @@ C:\Tools\.venv\Scripts\python.exe app.py
 | `job_intake_registry.py` | Transactional SQLite registry of intakes (`_runtime/job_intake_registry.db`). Entries are JSON blobs in a `data` column, keyed by `job_number`+`label`. No Qt. |
 | `job_intake_service.py` | All orchestration: `create_intake` (the whole intake sequence), path resolution, folder creation, RPD clone, PO scraping, import-CSV build, RADAN/block wrappers. **No Qt** — that's what lets the listener reuse it. |
 | `job_intake_page.py` | `JobIntakePage` Qt widget: queue table, parts grid, action buttons, background polling. |
-| `job_intake_server.py` | Loopback HTTPS listener for the Outlook add-in. Owns no intake logic. |
+| `job_intake_server.py` | Loopback HTTPS listener for the Outlook add-in. Owns no intake logic. Declares `API_VERSION`, which **must** match `Private Const API_VERSION` in `outlook_vba/JobIntake.bas` — bump both together and tell the user to re-import the `.bas`, because the copy inside Outlook is a hand-imported snapshot. A test asserts they agree. |
 | `job_intake_tls.py` | Local root CA + loopback leaf cert, so Office gets the HTTPS it demands. |
 | `explorer_bridge.py` | Lazily loads `truck_nest_explorer`'s RADAN import + block transfer. |
 | `app.py` | Standalone window launcher; also starts the listener on a daemon thread. |
