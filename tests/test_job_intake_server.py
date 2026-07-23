@@ -121,6 +121,11 @@ def test_submit_creates_folder_and_registry_entry_with_outlook_source(client) ->
             # Tracked per field, and never rewritten by the UI.
             "conflicts": {},
             "resolved": {},
+            # What each source read, kept whether or not they agreed. Empty
+            # here because this stub DXF arrived with no PO line, no print and
+            # no drawing text - nothing named anything.
+            "source_materials": {},
+            "source_thicknesses": {},
         }
     ]
 

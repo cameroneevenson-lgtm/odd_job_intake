@@ -996,6 +996,86 @@ def test_files_already_on_the_shared_drive_are_referenced_not_copied(
     assert sorted(p.name for p in shared.iterdir()) == ["Panel.dxf", "Panel.pdf"]
 
 
+def test_a_po_line_naming_a_gauge_and_metal_maps_to_the_stocked_pair() -> None:
+    """M60020, from the shop floor.
+
+    The PO line was "16GA-SS SIDE PLATE - 16GA SS #4". The PO was reference-only
+    at the time, so nothing predicted anything, the row reached the grid blank,
+    and it was filled in by hand as Mild Steel-A36 at 0.12 - the wrong alloy at
+    twice the thickness - and the blocks went to the machine.
+
+    16GA stainless is 0.0598, which is stocked as 0.06 and cut N2.
+    """
+    line = "16GA-SS SIDE PLATE - 16GA SS #4"
+    material = job_intake_service._match_material_in_text(line)
+    assert material == "Stainless Steel"
+    assert job_intake_service.thickness_from_text(line, material) == 0.06
+    assert job_intake_service.default_strategy_for_material(material) == "N2"
+
+    # The same gauge is a different thickness in aluminium, so it is only ever
+    # read against a known metal.
+    assert job_intake_service.thickness_from_text("16GA", None) is None
+
+
+def test_a_measurement_in_the_text_outranks_a_gauge_in_the_same_text() -> None:
+    assert job_intake_service.thickness_from_text(
+        "1/4 THK PLATE, was 16GA", "Mild Steel-A36"
+    ) == 0.25
+    # A gauge the shop does not stock in that metal resolves to nothing rather
+    # than to whatever happened to be nearest.
+    assert job_intake_service.thickness_from_text("16GA", "Mild Steel-A36") is None
+
+
+def test_a_value_no_source_stated_is_a_stop_not_a_silent_override(tmp_path: Path) -> None:
+    """The other half of M60020.
+
+    Choosing a value settles a dispute *between sources* - the human picks the
+    winner. Typing a third thing no source named is overriding them all, and
+    that used to mark the field resolved on the way past. It now has to be
+    acknowledged like any other disagreement.
+    """
+    entry = _entry_with_parts(tmp_path)
+    part = entry["material_qty"][0]
+    part["source_materials"] = {"the PO": "Stainless Steel"}
+    part["source_thicknesses"] = {"the PO": 0.06}
+    part["material"] = "Mild Steel-A36"
+    part["thickness"] = 0.12
+    part["material_confirmed"] = True
+    part["qty_unknown"] = False
+    part["resolved"] = {}
+
+    with pytest.raises(JobIntakeError) as excinfo:
+        build_import_csv_rows(entry)
+    message = str(excinfo.value)
+    assert "STOP" in message
+    assert "no source stated" in message
+    assert "the PO says Stainless Steel" in message
+
+    # Recording the override is what releases it - the human stays the
+    # authority, they just cannot do it by accident.
+    part["resolved"] = {"material": True, "thickness": True}
+    assert len(build_import_csv_rows(entry)) == 1
+
+
+def test_agreeing_with_a_source_is_not_an_override(tmp_path: Path) -> None:
+    """The check must not fire on the ordinary case of accepting the
+    prediction, or it becomes noise that gets clicked through."""
+    entry = _entry_with_parts(tmp_path)
+    part = entry["material_qty"][0]
+    part["source_materials"] = {"the PO": part["material"]}
+    part["source_thicknesses"] = {"the PO": part["thickness"]}
+    part["material_confirmed"] = True
+    part["qty_unknown"] = False
+    part["resolved"] = {}
+
+    assert len(build_import_csv_rows(entry)) == 1
+
+    # And a job where nothing named anything is unaffected.
+    part["source_materials"] = {}
+    part["source_thicknesses"] = {}
+    assert len(build_import_csv_rows(entry)) == 1
+
+
 def test_finishing_with_a_job_files_it_away_and_never_deletes_it(
     tmp_path, monkeypatch
 ) -> None:

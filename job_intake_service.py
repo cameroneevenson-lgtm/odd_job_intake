@@ -444,19 +444,7 @@ def extract_email_hints(text: str) -> EmailHints:
     # "make these in 11ga" - and this was the one source that could not
     # understand it. Only with a material in hand, because 11GA is 0.118 in
     # steel and 0.090 in aluminium.
-    thickness = None
-    if material is not None:
-        thickness_match = _DXF_THICKNESS_PATTERN.search(body)
-        if thickness_match is not None:
-            thickness = snap_thickness(
-                _parse_fraction_or_number(thickness_match.group(1)), material
-            )
-        if thickness is None:
-            gauge_match = _GAUGE_PATTERN.search(body)
-            if gauge_match is not None:
-                thickness = snap_thickness(
-                    _gauge_to_inches(int(gauge_match.group(1)), material), material
-                )
+    thickness = thickness_from_text(body, material)
 
     return EmailHints(
         material=material,
@@ -803,12 +791,27 @@ def complete_intake(
             )
             if note not in notes:
                 notes.append(note)
+        # The PO's own line for this part. Ranked last of everything - a
+        # customer's wording is the least structured thing here - but it does
+        # now predict, where it used to be reference-only.
+        #
+        # The old rule left the row blank whenever the PO was the only source
+        # that named a material, and a blank row tells whoever fills it in
+        # nothing at all. A prediction they can see and check is strictly more
+        # use than silence, and every row is verified by hand before it reaches
+        # RADAN anyway. "16GA SS #4" therefore resolves to Stainless Steel at
+        # 0.06 rather than to nothing.
+        po_description = str(hint.get("raw_description", "") or "")
+        po_material = _match_material_in_text(po_description)
+        po_thickness = thickness_from_text(po_description, po_material)
+
         material = (
             (cam_row["material"] if cam_row else None)
             or bom_material
             or email_hints.material
             or print_hints.material
             or dxf_hints.material
+            or po_material
         )
         # Same precedence the material above uses, for the same reason: someone
         # typed it deliberately for this job, which outranks a drawing note but
@@ -819,27 +822,18 @@ def complete_intake(
             or email_hints.thickness
             or print_hints.thickness
             or dxf_hints.thickness
+            # Only the PO's own reading, which was measured against the PO's
+            # own material - not a gauge from one source resolved against a
+            # material from another.
+            or (po_thickness if material == po_material else None)
         )
-        material_source = (
-            (f"BOM via inventor_to_radan" if cam_row else None)
-            or (bom_row.description if bom_material else None)
-            or (email_hints.material_source_text if email_hints.material else None)
-            or print_hints.material_source_text
-            or dxf_hints.material_source_text
-        )
-
         # Cross-check: where two sources both named a material, they should
         # agree. A disagreement is worth a human look - it usually means a
         # print was superseded by the BOM, or the email is about a different
         # job - and is far more useful surfaced than silently resolved by
-        # whichever source happened to rank higher.
-        # The PO's own wording for this line. It is not used to *choose* a
-        # material - customer POs spell it inconsistently, which is why that
-        # has always been reference-only - but it absolutely gets a say in
-        # whether the sources agree. A PO asking for aluminium against a print
-        # drawn in steel is the exact disagreement worth stopping for.
-        po_material = _match_material_in_text(str(hint.get("raw_description", "") or ""))
-
+        # whichever source happened to rank higher. A PO asking for aluminium
+        # against a print drawn in steel is the exact disagreement worth
+        # stopping for.
         stated = {
             "the CAM BOM": cam_row["material"] if cam_row else None,
             "the BOM": bom_material,
@@ -849,6 +843,18 @@ def complete_intake(
             "the drawing": dxf_hints.material,
         }
         named = {where: value for where, value in stated.items() if value}
+
+        material_source = (
+            (f"BOM via inventor_to_radan" if cam_row else None)
+            or (bom_row.description if bom_material else None)
+            or (email_hints.material_source_text if email_hints.material else None)
+            or print_hints.material_source_text
+            or dxf_hints.material_source_text
+            # Whose words produced the prediction. When the PO is what named
+            # the material, its line is what the user needs to check against.
+            or (po_description.strip() if po_material else None)
+        )
+
         # Tracked per field, not as one blob: a quantity disagreement must not
         # be clearable by settling the material, and vice versa.
         conflicts: dict[str, str] = {}
@@ -856,6 +862,17 @@ def complete_intake(
             detail = ", ".join(f"{where} says {value}" for where, value in named.items())
             conflicts["material"] = detail
             note = f"{name}: sources disagree on material - {detail}"
+            if note not in notes:
+                notes.append(note)
+        elif po_material and material == po_material and len(named) == 1:
+            # The PO is the only source that named a material, so the whole
+            # prediction rests on a customer's wording. Worth saying out loud
+            # rather than letting it look as settled as a BOM-backed row.
+            note = (
+                f"{name}: no drawing or BOM named a material - {po_material}"
+                + (f" at {po_thickness:g}" if po_thickness else "")
+                + f" comes only from the PO ({po_description.strip()}). Check it."
+            )
             if note not in notes:
                 notes.append(note)
 
@@ -868,6 +885,10 @@ def complete_intake(
             "the email": email_hints.thickness,
             "the print": print_hints.thickness,
             "the drawing": dxf_hints.thickness,
+            # Only when the PO agreed on the material. A gauge read against
+            # the wrong metal is a different thickness, so it would be
+            # disputing a number it never actually stated.
+            "the PO": po_thickness if material == po_material else None,
         }
         thickness_named = {
             where: value for where, value in thickness_stated.items() if value
@@ -985,6 +1006,19 @@ def complete_intake(
                 # choosing a value for *that* field; settling the material says
                 # nothing about a disputed quantity.
                 "resolved": {},
+                # Every source's own reading, kept whether or not they agreed.
+                #
+                # A conflict needs two sources to disagree, so a *lone* source
+                # used to say nothing at all: the PO could state "16GA SS #4",
+                # be the only thing that named a material, and the row would go
+                # to the grid blank and silent. Whoever filled it in then had
+                # no idea the PO had already answered. Recorded here so a
+                # single source can still be heard, and so the gate can tell a
+                # hand-picked value apart from one a source actually stated.
+                "source_materials": dict(named),
+                "source_thicknesses": {
+                    where: value for where, value in thickness_named.items()
+                },
             }
         )
 
@@ -2189,6 +2223,40 @@ def _gauge_to_inches(gauge: int, material: str) -> float | None:
     return table.get(int(gauge))
 
 
+def thickness_from_text(text: str, material: str | None) -> float | None:
+    """A stocked thickness named anywhere in `text`, for a known material.
+
+    A measurement wins over a gauge - "1/4 THK 16GA-ish stock" means the
+    quarter inch - and the result is snapped onto what the shop actually
+    stocks, so a value near nothing real resolves to nothing rather than to
+    whatever was closest.
+
+    The material is required, not optional: a gauge number alone is not a
+    thickness. 16GA is 0.0598 in steel and stainless but 0.0508 in aluminium,
+    and 11GA is 0.118 against 0.090. Reading one without knowing the metal is
+    how a part gets cut at the wrong thickness.
+    """
+    if not material:
+        return None
+    body = str(text or "")
+
+    match = _DXF_THICKNESS_PATTERN.search(body)
+    if match is not None:
+        snapped = snap_thickness(_parse_fraction_or_number(match.group(1)), material)
+        if snapped is not None:
+            return snapped
+
+    gauge_match = _GAUGE_PATTERN.search(body)
+    if gauge_match is not None:
+        try:
+            return snap_thickness(
+                _gauge_to_inches(int(gauge_match.group(1)), material), material
+            )
+        except ValueError:
+            return None
+    return None
+
+
 def snap_thickness(value: float | None, material: str) -> float | None:
     """Snap a measured thickness onto the nearest one the shop stocks.
 
@@ -3025,6 +3093,31 @@ def extract_bom_rows(pdf_path: Path, part_stems: list[str]) -> dict[str, BomRow]
 # --- RADAN import CSV --------------------------------------------------------
 
 
+def _is_override(chosen: Any, readings: dict[str, Any] | None) -> bool:
+    """Whether `chosen` contradicts every source that named a value.
+
+    False when no source named one - there is nothing to contradict, and a job
+    filed from bare DXFs is the ordinary case.
+    """
+    stated = {value for value in (readings or {}).values() if value}
+    return bool(stated) and chosen not in stated
+
+
+def _describe_override(field: str, chosen: Any, readings: dict[str, Any] | None) -> str:
+    def shown(value: Any) -> str:
+        return f"{value:g}" if isinstance(value, float) else str(value)
+
+    said = ", ".join(
+        f"{where} says {shown(value)}"
+        for where, value in (readings or {}).items()
+        if value
+    )
+    return (
+        f"the {field} is set to {shown(chosen)}, which no source stated ({said}). "
+        f"Use what a source says, or tick Verified to record the override"
+    )
+
+
 def build_import_csv_rows(entry: dict[str, Any]) -> list[list[str]]:
     """The exact 6-column, headerless shape radan_automation's
     read_import_csv expects: dxf_path, qty, material, thickness, unit, strategy."""
@@ -3087,6 +3180,24 @@ def build_import_csv_rows(entry: dict[str, Any]) -> list[list[str]]:
                 + "; ".join(open_conflicts)
                 + ". Confirm with whoever requested the job, then set that field"
             )
+            continue
+
+        # A value nobody stated. Not a disagreement between sources - those are
+        # caught above - but the human's own answer differing from every source
+        # that spoke, which is the same hazard wearing different clothes and
+        # was not checked at all. Overriding is allowed; doing it by accident
+        # is not, so it has to be settled per field like any other dispute.
+        overrides = [
+            _describe_override(field, chosen, readings)
+            for field, chosen, readings in (
+                ("material", material, part.get("source_materials")),
+                ("thickness", thickness, part.get("source_thicknesses")),
+            )
+            if not resolved.get(field)
+            and _is_override(chosen, readings)
+        ]
+        if overrides:
+            problems.append(f"{filename}: STOP - " + "; ".join(overrides))
             continue
 
         if not material:

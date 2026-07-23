@@ -837,10 +837,22 @@ class JobIntakePage(QWidget):
 
             # Choosing a value for a field is what settles a dispute about it -
             # a real decision, not a generic acknowledgement.
+            #
+            # But only when the chosen value is one a source actually stated.
+            # Picking between two readings is settling the dispute; typing a
+            # third thing no source named is overriding them all, and that must
+            # not quietly mark the disagreement handled. Left unresolved here
+            # so the import gate asks about it.
+            def _settles(field: str, value, readings: dict) -> bool:
+                stated = {v for v in (readings or {}).values() if v}
+                return not stated or value in stated
+
             if material and material != stored.get("material"):
-                resolved["material"] = True
+                if _settles("material", material, stored.get("source_materials")):
+                    resolved["material"] = True
             if thickness and thickness != stored.get("thickness"):
-                resolved["thickness"] = True
+                if _settles("thickness", thickness, stored.get("source_thicknesses")):
+                    resolved["thickness"] = True
             if row in self._qty_answered:
                 resolved["quantity"] = True
             if verified_item is not None and verified_item.checkState() == Qt.CheckState.Checked:
