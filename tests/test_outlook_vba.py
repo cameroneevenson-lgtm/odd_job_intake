@@ -115,6 +115,52 @@ def test_no_module_level_declaration_sits_between_procedures() -> None:
     )
 
 
+# Words VBA will not accept as an identifier. Built-in *functions* - Date, Len,
+# Mid, String, Error, Text, Line - are deliberately absent: those can be
+# shadowed, and JobIntake.bas already shadows Text in three places and compiles.
+# Listing them would be noise, and a check that cries wolf gets ignored.
+_VBA_RESERVED = frozenset(
+    """and as boolean byref byte byval call case class const currency debug dim do double
+    each else elseif empty end endif enum eqv event exit false for function get gosub goto
+    if imp implements in integer is let like long loop lset me mod new next not nothing null
+    on option optional or paramarray preserve private public raiseevent redim rem resume
+    return rset select set shared single static stop sub then to true type typeof until
+    variant wend while with withevents xor""".split()
+)
+
+_DIM_OR_CONST = re.compile(r"\b(?:Dim|Const)\s+([A-Za-z_]\w*)")
+_EXTRA_DECLARED = re.compile(r",\s*([A-Za-z_]\w*)\s+As\s")
+_PARAM_LIST = re.compile(r"\b(?:Sub|Function|Property)\s+\w+\s*\(([^)]*)")
+_PARAM_NAME = re.compile(r"\s*(?:ByVal\s+|ByRef\s+|Optional\s+)*([A-Za-z_]\w*)")
+
+
+def test_no_identifier_collides_with_a_vba_keyword() -> None:
+    """The third compile error to reach the shop floor.
+
+    `Dim until As Date` is rejected, because Until is a keyword (Do Until /
+    Loop Until). VBA reports it only as "Syntax error" on the Dim line, which
+    says nothing about why - and the module is imported by hand, so the error
+    surfaces at the machine rather than here.
+    """
+    offenders: list[str] = []
+    for number, line in _code_lines():
+        names = _DIM_OR_CONST.findall(line) + _EXTRA_DECLARED.findall(line)
+        params = _PARAM_LIST.search(line)
+        if params:
+            for parameter in params.group(1).split(","):
+                match = _PARAM_NAME.match(parameter)
+                if match:
+                    names.append(match.group(1))
+        for name in names:
+            if name.casefold() in _VBA_RESERVED:
+                offenders.append(f"line {number}: {name!r} in {line[:60]}")
+
+    assert not offenders, (
+        "these names are VBA keywords and cannot be identifiers; VBA reports "
+        "them only as 'Syntax error':\n  " + "\n  ".join(offenders)
+    )
+
+
 @pytest.mark.parametrize(
     "name",
     ["SendToJobIntake", "JsonValue", "HttpCall", "WaitForIntakeAndReply", "DraftReply"],

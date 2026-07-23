@@ -566,9 +566,11 @@ End Function
 ' Sleep without freezing Outlook: DoEvents lets it keep painting and
 ' responding while the shop app works, which a blocking call would not.
 Private Sub WaitWithEvents(seconds As Long)
-    Dim until As Date
-    until = DateAdd("s", seconds, Now)
-    Do While Now < until
+    ' Not named "until": that is a VBA keyword (Do Until / Loop Until) and
+    ' using it as a variable is a compile error reported only as "Syntax error".
+    Dim resumeAt As Date
+    resumeAt = DateAdd("s", seconds, Now)
+    Do While Now < resumeAt
         DoEvents
     Loop
 End Sub
