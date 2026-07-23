@@ -1130,23 +1130,73 @@ def _assert_under_shop_root(target: Path) -> None:
         )
 
 
-def delete_job_files(entry: dict[str, Any]) -> str:
-    """Remove an intake's folder from the shop drive.
+# Where finished work is filed on the shop drive. Every job root already has
+# one of these, holding whole job folders - 1348 of them under M-FABRICATION -
+# so this follows the shop's existing habit rather than inventing a home.
+COMPLETED_FOLDER_NAME = "Completed"
 
-    The registry entry is the caller's business; this only handles the files,
-    and only inside BATTLESHIELD_ROOT.
+
+def can_move_to_completed(entry: dict[str, Any]) -> tuple[bool, str]:
+    """Whether this intake's folder is ours to file away, and why not if it isn't.
+
+    A labeled one-off lives *inside* a job folder that already existed - a real
+    truck, usually - and moving it would pull work out of somebody else's job.
+    Only an intake that owns its whole job-number folder can be filed, which is
+    the same rule truck_nest_explorer uses to tell a standalone one-off from
+    work attached to a truck.
     """
     folder_text = str(entry.get("job_folder") or "")
     if not folder_text:
-        return "No job folder recorded for this intake."
-    folder = Path(folder_text)
-    if not folder.exists():
-        return f"{folder} no longer exists."
+        return False, "This intake has no job folder recorded."
+    if not Path(folder_text).exists():
+        return False, f"{folder_text} no longer exists."
+    if entry.get("label"):
+        return False, (
+            f"{entry.get('job_number')} {entry.get('label')} sits inside "
+            f"{entry.get('job_number')}'s own folder, which this app did not create. "
+            "Move it by hand if it should be filed away."
+        )
+    return True, ""
 
-    _assert_under_shop_root(folder)
-    file_count = sum(1 for _ in folder.rglob("*") if _.is_file())
-    shutil.rmtree(folder)
-    return f"Deleted {folder} ({file_count} file(s))."
+
+def plan_move_to_completed(entry: dict[str, Any]) -> tuple[Path, Path]:
+    """(source, destination) for filing this job away, validated.
+
+    Raises rather than guessing: the caller shows this to the user before
+    anything moves, and a move on the shop drive is not something to discover
+    afterwards.
+    """
+    allowed, reason = can_move_to_completed(entry)
+    if not allowed:
+        raise JobIntakeError(reason)
+
+    source = Path(str(entry.get("job_folder")))
+    root_name = resolve_job_root(str(entry.get("job_number", "")))
+    destination = BATTLESHIELD_ROOT / root_name / COMPLETED_FOLDER_NAME / source.name
+
+    _assert_under_shop_root(source)
+    _assert_under_shop_root(destination)
+    if destination.exists():
+        raise JobIntakeError(
+            f"{destination} already exists. Sort out which one is current before "
+            "filing this away."
+        )
+    return source, destination
+
+
+def move_job_to_completed(entry: dict[str, Any]) -> str:
+    """File a finished job under its root's Completed folder.
+
+    A move, never a delete. The work stays on L: where it can be found again;
+    it just stops sitting in the active area.
+    """
+    source, destination = plan_move_to_completed(entry)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(source), str(destination))
+    except OSError as exc:
+        raise JobIntakeError(f"Could not move {source} to {destination}: {exc}") from exc
+    return f"Moved {source.name} to {destination.parent}."
 
 
 @dataclass(frozen=True)

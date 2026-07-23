@@ -478,9 +478,23 @@ class JobIntakePage(QWidget):
         self.send_blocks_button.clicked.connect(self._send_blocks)
         self.rename_button = QPushButton("Rename Job")
         self.rename_button.clicked.connect(self._rename_job)
-        self.delete_button = QPushButton("Delete Intake")
+        # Named for what it does. "Delete" described the queue entry but read
+        # as the job, and it used to be able to remove the folder too.
+        self.delete_button = QPushButton("Done With Intake")
+        self.delete_button.setToolTip(
+            "Take this job off the queue. Its files are never deleted; you can "
+            "optionally file the folder under the root's Completed folder."
+        )
         self.delete_button.clicked.connect(self._delete_intake)
-        self.apply_bom_button = QPushButton("Apply BOM (inventor_to_radan)")
+        # Named as truck_nest_explorer names the same action. Both run
+        # inventor_to_radan over a spreadsheet BOM, and one button doing one
+        # job should not be called two different things depending on which app
+        # you happen to be standing in.
+        self.apply_bom_button = QPushButton("Run Inventor Tool")
+        self.apply_bom_button.setToolTip(
+            "Run inventor_to_radan over this job's spreadsheet BOM and fill in "
+            "the part rows from what it returns."
+        )
         self.apply_bom_button.clicked.connect(self._apply_bom)
         self.full_flow_button = QPushButton("Run Full Flow")
         self.full_flow_button.clicked.connect(self._run_full_flow)
@@ -904,41 +918,64 @@ class JobIntakePage(QWidget):
         return job_intake_service.create_intake(job_number, label or None, files, source="manual")
 
     def _delete_intake(self) -> None:
+        """Take the job off the queue. Never delete anything.
+
+        Finishing with a job means it leaves the queue - it does not mean the
+        work should be erased. This used to offer to delete the folder in the
+        same prompt, which put an irreversible removal of real work on L: one
+        button away from an everyday tidy-up.
+
+        The optional extra is now filing the folder under the root's Completed
+        folder, which is where the shop already keeps finished work. Clearing
+        the queue alone is the plain answer, and Cancel is the default button.
+        """
         entry = self._selected_entry()
         if entry is None:
             return
         key = str(entry.get("key", ""))
         folder = str(entry.get("job_folder") or "")
+        can_file, why_not = job_intake_service.can_move_to_completed(entry)
 
-        prompt = f"Remove the intake {key} from the queue?"
-        if folder:
-            prompt += (
-                f"\n\nIts folder is:\n{folder}\n\n"
-                "Choose Yes to delete the folder too, No to keep the files and "
-                "only remove the queue entry."
-            )
-        answer = QMessageBox.question(
-            self,
-            "Delete Intake",
-            prompt,
-            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-            QMessageBox.Cancel,
+        box = QMessageBox(self)
+        box.setWindowTitle("Done With Intake")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Take {key} off the queue?")
+
+        detail = f"Its files stay on L: either way:\n{folder}" if folder else ""
+        if can_file:
+            destination = job_intake_service.plan_move_to_completed(entry)[1].parent
+            detail += f"\n\nYou can also file the folder away under:\n{destination}"
+        elif folder and why_not:
+            detail += f"\n\nIt cannot be filed away automatically: {why_not}"
+        box.setInformativeText(detail.strip())
+
+        remove_button = box.addButton("Remove from Queue", QMessageBox.AcceptRole)
+        file_button = (
+            box.addButton("File Away && Remove", QMessageBox.AcceptRole) if can_file else None
         )
-        if answer == QMessageBox.Cancel:
+        cancel_button = box.addButton(QMessageBox.Cancel)
+        # Cancel is the default, so leaning on Enter changes nothing.
+        box.setDefaultButton(cancel_button)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is cancel_button or clicked is None:
             return
 
         message = ""
-        if answer == QMessageBox.Yes and folder:
+        if file_button is not None and clicked is file_button:
             try:
-                message = job_intake_service.delete_job_files(entry)
+                message = job_intake_service.move_job_to_completed(entry)
             except JobIntakeError as exc:
-                QMessageBox.warning(self, "Delete Intake", str(exc))
+                QMessageBox.warning(self, "Done With Intake", str(exc))
                 return
+        else:
+            message = "Its files were left where they are."
 
         job_intake_registry.delete_entry(key)
         self._selected_key = None
         self.refresh()
-        self.activity_label.setText(f"Removed {key}. {message}".strip())
+        self.activity_label.setText(f"Took {key} off the queue. {message}".strip())
 
     def _rename_job(self) -> None:
         """Renumber a job: folders, project files, and the references inside
@@ -1024,11 +1061,11 @@ class JobIntakePage(QWidget):
         try:
             updated, message = job_intake_service.apply_cam_bom(entry)
         except JobIntakeError as exc:
-            QMessageBox.warning(self, "Apply BOM", str(exc))
+            QMessageBox.warning(self, "Run Inventor Tool", str(exc))
             return
 
         if not updated:
-            QMessageBox.information(self, "Apply BOM", message)
+            QMessageBox.information(self, "Run Inventor Tool", message)
             return
 
         job_intake_registry.update_entry(

@@ -996,6 +996,90 @@ def test_files_already_on_the_shared_drive_are_referenced_not_copied(
     assert sorted(p.name for p in shared.iterdir()) == ["Panel.dxf", "Panel.pdf"]
 
 
+def test_finishing_with_a_job_files_it_away_and_never_deletes_it(
+    tmp_path, monkeypatch
+) -> None:
+    """Being done with a job means it leaves the queue, not that the work is
+    erased. The optional extra is a move into the root's Completed folder,
+    which is where the shop already keeps finished work."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    paths = job_intake_service.resolve_job_paths("M59919", None)
+    job_intake_service.create_job_folders(paths)
+    (paths.intake_dir / "Bracket.dxf").write_text("dxf", encoding="utf-8")
+    entry = {"job_number": "M59919", "label": None, "job_folder": str(paths.intake_dir)}
+
+    allowed, reason = job_intake_service.can_move_to_completed(entry)
+    assert allowed, reason
+
+    message = job_intake_service.move_job_to_completed(entry)
+
+    moved = tmp_path / "L" / "M-FABRICATION" / "Completed" / "M59919"
+    assert moved.is_dir()
+    assert (moved / "Bracket.dxf").read_text(encoding="utf-8") == "dxf", "the work was lost"
+    assert not paths.intake_dir.exists(), "it was copied rather than filed away"
+    assert "Completed" in message
+
+
+def test_a_labeled_one_off_is_not_pulled_out_of_the_job_it_belongs_to(
+    tmp_path, monkeypatch
+) -> None:
+    """A labeled intake sits inside a job folder this app did not create -
+    usually a real truck. Filing it away would pull work out of somebody
+    else's job, so it is refused with a reason rather than half-done."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    truck = tmp_path / "L" / "F-LARGE FLEET" / "F57524"
+    (truck / "EXTRA PARTS").mkdir(parents=True)
+    entry = {
+        "job_number": "F57524",
+        "label": "EXTRA PARTS",
+        "job_folder": str(truck / "EXTRA PARTS"),
+    }
+
+    allowed, reason = job_intake_service.can_move_to_completed(entry)
+    assert not allowed
+    assert "did not create" in reason
+
+    with pytest.raises(JobIntakeError):
+        job_intake_service.move_job_to_completed(entry)
+    assert (truck / "EXTRA PARTS").is_dir(), "the label folder was moved anyway"
+
+
+def test_filing_away_refuses_to_overwrite_an_existing_completed_folder(
+    tmp_path, monkeypatch
+) -> None:
+    """Two folders with one job number is a question for a human, not
+    something to resolve by overwriting the older one."""
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    paths = job_intake_service.resolve_job_paths("M59919", None)
+    job_intake_service.create_job_folders(paths)
+    existing = tmp_path / "L" / "M-FABRICATION" / "Completed" / "M59919"
+    existing.mkdir(parents=True)
+    (existing / "older.dxf").write_text("older", encoding="utf-8")
+    entry = {"job_number": "M59919", "label": None, "job_folder": str(paths.intake_dir)}
+
+    with pytest.raises(JobIntakeError) as excinfo:
+        job_intake_service.move_job_to_completed(entry)
+    assert "already exists" in str(excinfo.value)
+    assert (existing / "older.dxf").read_text(encoding="utf-8") == "older"
+    assert paths.intake_dir.exists()
+
+
+def test_the_service_offers_no_way_to_delete_a_job_folder() -> None:
+    """Deleting shop work is not something this app does.
+
+    It used to: "Delete Intake" offered to remove the folder in the same
+    prompt that cleared the queue entry. The capability is gone rather than
+    merely unwired, so it cannot be reconnected by accident.
+    """
+    assert not hasattr(job_intake_service, "delete_job_files")
+
+    source = Path(job_intake_service.__file__).read_text(encoding="utf-8")
+    assert "shutil.rmtree" not in source, (
+        "a recursive delete is back in the intake service; the only removal "
+        "this app performs is taking an entry off the queue"
+    )
+
+
 def _word(text: str) -> tuple:
     """A PyMuPDF word box; only the text matters for these."""
     return (0.0, 0.0, 10.0, 10.0, text)
