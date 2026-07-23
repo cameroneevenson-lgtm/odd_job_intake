@@ -1017,6 +1017,69 @@ def test_a_po_line_naming_a_gauge_and_metal_maps_to_the_stocked_pair() -> None:
     assert job_intake_service.thickness_from_text("16GA", None) is None
 
 
+def test_a_dxf_file_name_that_states_its_metal_is_read(tmp_path, monkeypatch) -> None:
+    """Whoever exports the DXF often says the metal and gauge in the name.
+
+    M60020's part was called "16GA-SS SIDE PLATE.DXF" and nothing read it, so
+    a name that stated the answer counted for nothing. 16GA stainless is
+    0.0598, which the shop stocks as 0.06 and cuts N2.
+    """
+    shop = tmp_path / "inventor_to_radan"
+    _write_shop_csvs(
+        shop,
+        descriptions=['SHEET, SS, .0598" THK, 304'],
+        rules=[('SHEET, SS, .0598" THK, 304', "Stainless Steel", "0.06", "N2")],
+    )
+    monkeypatch.setattr(job_intake_service, "INVENTOR_TO_RADAN_DIR", shop)
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    monkeypatch.setattr(
+        job_intake_registry, "JOB_INTAKE_REGISTRY_PATH", tmp_path / "registry.json"
+    )
+    monkeypatch.setattr(
+        job_intake_service, "MATERIAL_MEMORY_PATH", tmp_path / "fingerprints.json"
+    )
+    dxf = tmp_path / "16GA-SS SIDE PLATE.DXF"
+    dxf.write_text("0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n", encoding="utf-8")
+
+    entry = job_intake_service.create_intake("M60030", None, [dxf])
+
+    part = entry["material_qty"][0]
+    assert part["material"] == "Stainless Steel"
+    assert part["thickness"] == 0.06
+    assert part["strategy"] == "N2"
+    # Still a prediction, so it stays unconfirmed, and the name it came from is
+    # shown so it can be checked.
+    assert part["material_confirmed"] is False
+    assert "16GA-SS SIDE PLATE" in part["material_source_text"]
+    assert part["source_materials"] == {"the file name": "Stainless Steel"}
+    # And a row resting on a file name alone says so rather than looking as
+    # settled as a BOM-backed one.
+    assert any("comes only from the file name" in note for note in entry["po_unmatched"])
+
+
+@pytest.mark.parametrize(
+    "stem",
+    ["BRACKET-316", "PANEL-5052", "STEP-3003", "PLATE-304"],
+)
+def test_a_bare_grade_number_in_a_file_name_is_not_a_material(stem: str) -> None:
+    """In prose those are grades. In a file name they are indistinguishable
+    from a part number, and BRACKET-316.dxf is far more likely to be part 316
+    than a stainless bracket - so guessing from one would be worse than not
+    guessing at all."""
+    assert job_intake_service._match_material_in_text(stem, allow_bare_numbers=False) is None
+    # The prose rule is unchanged; only file names are read this narrowly.
+    assert job_intake_service._match_material_in_text(f"{stem} plate") is not None
+
+
+@pytest.mark.parametrize(
+    "stem", ["F59487-1", "SF-62", "D-602", "Clip-End", "Bracket", "P55249-3"]
+)
+def test_an_ordinary_part_number_file_name_predicts_nothing(stem: str) -> None:
+    """The common case by far. A file name that says nothing must stay silent
+    rather than reach for the nearest alias."""
+    assert job_intake_service._match_material_in_text(stem, allow_bare_numbers=False) is None
+
+
 def test_a_measurement_in_the_text_outranks_a_gauge_in_the_same_text() -> None:
     assert job_intake_service.thickness_from_text(
         "1/4 THK PLATE, was 16GA", "Mild Steel-A36"

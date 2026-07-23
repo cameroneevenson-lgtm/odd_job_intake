@@ -805,6 +805,17 @@ def complete_intake(
         po_material = _match_material_in_text(po_description)
         po_thickness = thickness_from_text(po_description, po_material)
 
+        # The DXF's own file name. Whoever exported it often says the metal and
+        # the gauge right there - "16GA-SS SIDE PLATE.DXF" - and nothing read
+        # it, so a name that stated the answer counted for nothing.
+        #
+        # Bare grade numbers are ignored here: in a file name 304, 316, 5052
+        # and 3003 are indistinguishable from part numbers, and guessing wrong
+        # from a part number would be worse than not guessing.
+        file_stem = Path(name).stem
+        name_material = _match_material_in_text(file_stem, allow_bare_numbers=False)
+        name_thickness = thickness_from_text(file_stem, name_material)
+
         material = (
             (cam_row["material"] if cam_row else None)
             or bom_material
@@ -812,6 +823,7 @@ def complete_intake(
             or print_hints.material
             or dxf_hints.material
             or po_material
+            or name_material
         )
         # Same precedence the material above uses, for the same reason: someone
         # typed it deliberately for this job, which outranks a drawing note but
@@ -822,10 +834,11 @@ def complete_intake(
             or email_hints.thickness
             or print_hints.thickness
             or dxf_hints.thickness
-            # Only the PO's own reading, which was measured against the PO's
-            # own material - not a gauge from one source resolved against a
-            # material from another.
+            # Only each source's own reading, measured against the material
+            # that same source named - never a gauge from one source resolved
+            # against a material from another.
             or (po_thickness if material == po_material else None)
+            or (name_thickness if material == name_material else None)
         )
         # Cross-check: where two sources both named a material, they should
         # agree. A disagreement is worth a human look - it usually means a
@@ -841,6 +854,7 @@ def complete_intake(
             "the email": email_hints.material,
             "the print": print_hints.material,
             "the drawing": dxf_hints.material,
+            "the file name": name_material,
         }
         named = {where: value for where, value in stated.items() if value}
 
@@ -850,9 +864,10 @@ def complete_intake(
             or (email_hints.material_source_text if email_hints.material else None)
             or print_hints.material_source_text
             or dxf_hints.material_source_text
-            # Whose words produced the prediction. When the PO is what named
-            # the material, its line is what the user needs to check against.
+            # Whose words produced the prediction. When the PO or the file name
+            # is what named the material, that is what the user checks against.
             or (po_description.strip() if po_material else None)
+            or (f"file name: {file_stem}" if name_material else None)
         )
 
         # Tracked per field, not as one blob: a quantity disagreement must not
@@ -864,14 +879,18 @@ def complete_intake(
             note = f"{name}: sources disagree on material - {detail}"
             if note not in notes:
                 notes.append(note)
-        elif po_material and material == po_material and len(named) == 1:
-            # The PO is the only source that named a material, so the whole
-            # prediction rests on a customer's wording. Worth saying out loud
-            # rather than letting it look as settled as a BOM-backed row.
+        elif len(named) == 1 and material and set(named) <= {"the PO", "the file name"}:
+            # The only source that named a material was a customer's PO line or
+            # whoever typed the file name. Both are worth using - they are
+            # often the only thing that says - but a row resting on one of them
+            # should not look as settled as a BOM-backed one, so it is said out
+            # loud rather than left to be noticed.
+            where = next(iter(named))
+            wording = po_description.strip() if where == "the PO" else file_stem
             note = (
-                f"{name}: no drawing or BOM named a material - {po_material}"
-                + (f" at {po_thickness:g}" if po_thickness else "")
-                + f" comes only from the PO ({po_description.strip()}). Check it."
+                f"{name}: no drawing or BOM named a material - {material}"
+                + (f" at {thickness:g}" if thickness else "")
+                + f" comes only from {where} ({wording}). Check it."
             )
             if note not in notes:
                 notes.append(note)
@@ -885,10 +904,11 @@ def complete_intake(
             "the email": email_hints.thickness,
             "the print": print_hints.thickness,
             "the drawing": dxf_hints.thickness,
-            # Only when the PO agreed on the material. A gauge read against
-            # the wrong metal is a different thickness, so it would be
+            # Only when that source agreed on the material. A gauge read
+            # against the wrong metal is a different thickness, so it would be
             # disputing a number it never actually stated.
             "the PO": po_thickness if material == po_material else None,
+            "the file name": name_thickness if material == name_material else None,
         }
         thickness_named = {
             where: value for where, value in thickness_stated.items() if value
@@ -2116,7 +2136,7 @@ def _material_grades() -> dict[str, set[str]]:
     return grades
 
 
-def _match_material_in_text(text: str) -> str | None:
+def _match_material_in_text(text: str, *, allow_bare_numbers: bool = True) -> str | None:
     """Canonical material for this text, only when exactly one matches.
 
     Two layers, both flattening drawing dialect onto the one string the CAM
@@ -2126,6 +2146,13 @@ def _match_material_in_text(text: str) -> str | None:
 
     Deliberately conservative: the standing rule is that material stays the
     user's choice, so anything ambiguous returns None and stays manual.
+
+    `allow_bare_numbers=False` drops the aliases that are nothing but digits -
+    304, 316, 5052, 3003. In prose those are grades; in a *file name* they are
+    indistinguishable from a part number, and BRACKET-316.dxf is far more
+    likely to be part 316 than a stainless bracket. Spelled aliases (SS,
+    STAINLESS, ALUM) stay, so a name that really does state its metal is still
+    read.
     """
     raw = str(text or "")
     if not raw.strip():
@@ -2157,6 +2184,8 @@ def _match_material_in_text(text: str) -> str | None:
         ]
         if not alias_tokens:
             continue
+        if not allow_bare_numbers and all(word.isdigit() for word in alias_tokens):
+            continue
         span = len(alias_tokens)
         if any(
             tokens[index : index + span] == alias_tokens
@@ -2166,6 +2195,8 @@ def _match_material_in_text(text: str) -> str | None:
 
     words = {word.casefold() for word in re.findall(r"[A-Za-z0-9]+", raw)}
     for token, material in _material_tokens().items():
+        if not allow_bare_numbers and token.isdigit():
+            continue
         if token in words and material in available:
             matches.add(material)
 
