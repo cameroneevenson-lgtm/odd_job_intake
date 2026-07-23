@@ -2660,6 +2660,46 @@ def write_import_csv(rows: list[list[str]], csv_path: Path) -> Path:
     return csv_path
 
 
+def assert_radan_is_safe_to_drive(explorer_services: Any, paths: JobPaths) -> None:
+    """Refuse to drive RADAN over COM while it is unsafe to do so.
+
+    Two separate hazards, both checked by truck_nest_explorer's own helpers
+    rather than reimplemented here:
+
+    - An open RADAN window. The headless helper drives RADAN over COM, and
+      attaching to a session someone is working in can corrupt the project
+      they have open.
+    - An import already running for this project, tracked by a PID lock file.
+      Two imports writing the same RPD is the same problem twice.
+    """
+    check_sessions = getattr(explorer_services, "visible_radan_sessions", None)
+    if callable(check_sessions):
+        try:
+            sessions = tuple(check_sessions())
+        except Exception:
+            # A failed check must not block work; the lock below still applies.
+            sessions = ()
+        if sessions:
+            detail = ", ".join(f"PID {pid} ({title})" for pid, title in sessions)
+            raise JobIntakeError(
+                "RADAN is open - close it before importing parts. The import "
+                "drives RADAN over COM and would be working in the same session "
+                f"you have open. Found: {detail}"
+            )
+
+    check_lock = getattr(explorer_services, "radan_csv_import_lock_status", None)
+    if callable(check_lock):
+        try:
+            running, lock_path, pid = check_lock(paths.rpd_path)
+        except Exception:
+            return
+        if running:
+            raise JobIntakeError(
+                f"A RADAN import is already running for this project (PID {pid}). "
+                f"Wait for it to finish. Lock: {lock_path}"
+            )
+
+
 def launch_radan_import(
     explorer_services: Any,
     *,
@@ -2676,6 +2716,7 @@ def launch_radan_import(
     Without it the parts import but the project has nothing to nest them on,
     so nesting cannot follow.
     """
+    assert_radan_is_safe_to_drive(explorer_services, paths)
     return explorer_services.launch_radan_csv_import(
         csv_path,
         paths.intake_dir,

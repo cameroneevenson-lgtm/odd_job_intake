@@ -1197,6 +1197,10 @@ class JobIntakePage(QWidget):
         log_dir.mkdir(parents=True, exist_ok=True)
         safe_key = "".join(char if char.isalnum() else "_" for char in key).strip("_")
         log_path = log_dir / f"job_intake_radan_import_{safe_key}_{int(time.time())}.log"
+        # The explorer's own live log window, so an import looks the same
+        # wherever it was started from. Opened before launching so a failure to
+        # launch is reported in it rather than only in a message box.
+        log_dialog = self._show_import_log(log_path)
         try:
             self._import_process = job_intake_service.launch_radan_import(
                 self._explorer_api.services,
@@ -1205,12 +1209,42 @@ class JobIntakePage(QWidget):
                 log_path=log_path,
             )
         except Exception as exc:
+            if log_dialog is not None:
+                log_dialog.mark_launch_failed(str(exc))
             QMessageBox.critical(self, "Import Parts to RADAN", str(exc))
             return
+        if log_dialog is not None:
+            log_dialog.set_process(self._import_process)
         self._import_context = (key, log_path)
         job_intake_registry.update_entry(key, csv_log_path=str(log_path))
         self.activity_label.setText(f"RADAN import running... log: {log_path}")
         self._update_button_states(entry)
+
+    def _show_import_log(self, log_path: Path) -> Any:
+        """truck_nest_explorer's ImportLogDialog, if it can be loaded.
+
+        Never fatal: the import itself is what matters, and the log file is on
+        disk either way. A missing sibling app should cost the window, not the
+        import.
+        """
+        try:
+            from explorer_bridge import load_import_log_dialog
+
+            dialog_class = load_import_log_dialog()
+        except Exception:
+            return None
+        try:
+            dialog = dialog_class(log_path, self)
+            dialog.show()
+        except Exception:
+            return None
+        self._import_log_dialogs = [
+            existing
+            for existing in getattr(self, "_import_log_dialogs", [])
+            if not existing.is_complete or existing.isVisible()
+        ]
+        self._import_log_dialogs.append(dialog)
+        return dialog
 
     def _send_blocks(self) -> None:
         entry = self._selected_entry()

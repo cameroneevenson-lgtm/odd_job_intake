@@ -32,5 +32,28 @@ def load_explorer_api() -> SimpleNamespace:
     services = SimpleNamespace(
         launch_radan_csv_import=inventor_bridge.launch_radan_csv_import,
         send_project_block_files_to_machine=w_block_transfer.send_project_block_files_to_machine,
+        # Safety checks before driving RADAN over COM. Both are the sibling
+        # app's own, re-exported by its services module - a second
+        # implementation here would be a second thing to get wrong about when
+        # it is safe to touch RADAN.
+        visible_radan_sessions=inventor_bridge.visible_radan_sessions,
+        radan_csv_import_lock_status=inventor_bridge.radan_csv_import_lock_status,
     )
     return SimpleNamespace(services=services)
+
+
+def load_import_log_dialog() -> type:
+    """truck_nest_explorer's live import-log dialog.
+
+    Reused rather than rebuilt so a RADAN import looks the same wherever it is
+    started from, and so there is one place that knows how to tail that log.
+    Imported only when an import actually runs - this module must stay
+    importable without the sibling app.
+    """
+    root = str(TRUCK_NEST_EXPLORER_DIR.resolve())
+    if not TRUCK_NEST_EXPLORER_DIR.exists():
+        raise RuntimeError(f"truck_nest_explorer was not found at {root}")
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    module = importlib.import_module("dialogs.import_log_dialog")
+    return module.ImportLogDialog

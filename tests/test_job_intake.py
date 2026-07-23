@@ -815,6 +815,43 @@ def test_a_placeholder_number_needs_a_label_and_parks_each_job_separately(
     assert "M-FABRICATION" in first["job_folder"]
 
 
+def test_radan_import_refuses_while_radan_is_open_or_already_importing(tmp_path, monkeypatch) -> None:
+    """Driving RADAN over COM while someone has it open can corrupt the project
+    they are working in, and two imports writing one RPD is the same problem
+    twice. Both checks are truck_nest_explorer's own, re-exported by its
+    services module - not reimplemented here."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(job_intake_service, "BATTLESHIELD_ROOT", tmp_path / "L")
+    paths = job_intake_service.resolve_job_paths("M59919", None)
+
+    radan_open = SimpleNamespace(
+        visible_radan_sessions=lambda: ((1234, "RADAN - somebody's job.rpd"),),
+        radan_csv_import_lock_status=lambda _p: (False, "lock", None),
+    )
+    with pytest.raises(JobIntakeError) as excinfo:
+        job_intake_service.assert_radan_is_safe_to_drive(radan_open, paths)
+    assert "RADAN is open" in str(excinfo.value)
+    assert "1234" in str(excinfo.value)
+
+    already_importing = SimpleNamespace(
+        visible_radan_sessions=lambda: (),
+        radan_csv_import_lock_status=lambda _p: (True, tmp_path / "x.lock", 999),
+    )
+    with pytest.raises(JobIntakeError) as excinfo:
+        job_intake_service.assert_radan_is_safe_to_drive(already_importing, paths)
+    assert "already running" in str(excinfo.value)
+
+    clear = SimpleNamespace(
+        visible_radan_sessions=lambda: (),
+        radan_csv_import_lock_status=lambda _p: (False, "lock", None),
+    )
+    job_intake_service.assert_radan_is_safe_to_drive(clear, paths)
+
+    # A sibling app too old to expose the checks must not block the import.
+    job_intake_service.assert_radan_is_safe_to_drive(SimpleNamespace(), paths)
+
+
 def test_conflicting_sources_are_a_hard_stop(tmp_path: Path) -> None:
     """Two sources giving different answers isn't a note to read past. Whoever
     asked for the job has to say which is right - ranking one source over the
